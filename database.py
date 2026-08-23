@@ -152,6 +152,17 @@ async def init_db():
             )
         """)
 
+        # Photo tickets table for attachment-based profile uploads
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS photo_tickets (
+                ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                confirmed BOOLEAN DEFAULT 0
+            )
+        """)
+
         # Performance Indexes
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_dating ON users(dating_enabled, dating_eligible, dating_pool, gender)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_likes_liker_target ON likes(liker_id, target_id)")
