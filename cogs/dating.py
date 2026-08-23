@@ -319,11 +319,14 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
 class DatingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.voice_cleanup_task.start()
         self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
         self._photo_ticket_monitors = {}  # ticket_id -> task
-        # recover outstanding tickets
-        bot.loop.create_task(self._recover_photo_tickets())
+
+    async def cog_load(self):
+        # Runs in an async context once the cog is added — safe place to start
+        # the background task loop and schedule the ticket-recovery coroutine.
+        self.voice_cleanup_task.start()
+        asyncio.create_task(self._recover_photo_tickets())
 
     def cog_unload(self):
         self.voice_cleanup_task.cancel()
