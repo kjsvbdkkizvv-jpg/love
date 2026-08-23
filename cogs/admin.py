@@ -97,14 +97,13 @@ class AdminCog(commands.Cog):
             my_profile_ch = interaction.guild.get_channel(config.CHANNEL_MY_PROFILE)
             if my_profile_ch:
                 embed = discord.Embed(
-                    title="👤 PROFILE & PREFERENCES CONTROL PANEL",
-                    description="Manage your profile, update direct photo URLs, adjust matching filters, or pause dating activity.",
+                    title="👤 PROFILE CONTROL PANEL",
+                    description="Manage your dating profile card, update your photos, or pause dating activity.",
                     color=config.PRIMARY_COLOR
                 )
                 view = discord.ui.View(timeout=None)
                 view.add_item(discord.ui.Button(label="👤 VIEW PROFILE", style=discord.ButtonStyle.primary, custom_id=config.ID_VIEW_PROFILE))
-                view.add_item(discord.ui.Button(label="✏️ EDIT PROFILE", style=discord.ButtonStyle.secondary, custom_id=config.ID_EDIT_PROFILE))
-                view.add_item(discord.ui.Button(label="⚙️ PREFERENCES", style=discord.ButtonStyle.secondary, custom_id=config.ID_PREFERENCES))
+                view.add_item(discord.ui.Button(label="✏️ CREATE / EDIT PROFILE", style=discord.ButtonStyle.secondary, custom_id=config.ID_EDIT_PROFILE))
                 view.add_item(discord.ui.Button(label="⏸️ PAUSE DATING", style=discord.ButtonStyle.danger, custom_id=config.ID_PAUSE_DATING))
                 await my_profile_ch.purge(limit=5)
                 await my_profile_ch.send(embed=embed, view=view)
