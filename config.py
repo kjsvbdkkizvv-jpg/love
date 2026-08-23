@@ -102,18 +102,42 @@ LEVEL_ROLES = {
 BASE_FEMALE_ROLE_ID = int(os.getenv("BASE_FEMALE_ROLE_ID", "1540676838878085120"))
 BASE_MALE_ROLE_ID = int(os.getenv("BASE_MALE_ROLE_ID", "1540676810747158588"))
 
-FEMALE_TIER_ORDER = ["Stacy Lite", "Stacy", "High Stacy"]
+FEMALE_TIER_ORDER = [
+    "Sub 3", "LLTB", "MLTB", "HLTB", "LMTB", "MMTB",
+    "HMTB", "LHTB", "MHTB", "HHTB", "Stacylite", "Stacy"
+]
 FEMALE_TIER_ROLES = {
-    "Stacy Lite": int(os.getenv("ROLE_STACY_LITE", "1511000000000000062")),
-    "Stacy": int(os.getenv("ROLE_STACY", "1511000000000000063")),
-    "High Stacy": int(os.getenv("ROLE_HIGH_STACY", "1511000000000000064")),
+    "Sub 3": int(os.getenv("ROLE_FEMALE_SUB_3", "1540677892386590790")),
+    "LLTB": int(os.getenv("ROLE_LLTB", "1540677888700055552")),
+    "MLTB": int(os.getenv("ROLE_MLTB", "1540677885256540211")),
+    "HLTB": int(os.getenv("ROLE_HLTB", "1540677881447850064")),
+    "LMTB": int(os.getenv("ROLE_LMTB", "1540677878285598822")),
+    "MMTB": int(os.getenv("ROLE_MMTB", "1540677874598678630")),
+    "HMTB": int(os.getenv("ROLE_HMTB", "1540677870949761045")),
+    "LHTB": int(os.getenv("ROLE_LHTB", "1540677867153661962")),
+    "MHTB": int(os.getenv("ROLE_MHTB", "1540677862854492190")),
+    "HHTB": int(os.getenv("ROLE_HHTB", "1540677859213967461")),
+    "Stacylite": int(os.getenv("ROLE_STACYLITE", "1540677855795478638")),
+    "Stacy": int(os.getenv("ROLE_STACY", "1540677853538943017")),
 }
 
-MALE_TIER_ORDER = ["Chad Lite", "Chad", "High Chad"]
+MALE_TIER_ORDER = [
+    "Sub 3", "LLTN", "MLTN", "HLTN", "LMTN", "MMTN",
+    "HMTN", "LHTN", "MHTN", "HHTN", "Chadlite", "Chad"
+]
 MALE_TIER_ROLES = {
-    "Chad Lite": int(os.getenv("ROLE_CHAD_LITE", "1511000000000000072")),
-    "Chad": int(os.getenv("ROLE_CHAD", "1511000000000000073")),
-    "High Chad": int(os.getenv("ROLE_HIGH_CHAD", "1511000000000000074")),
+    "Sub 3": int(os.getenv("ROLE_MALE_SUB_3", "1540677892386590790")),
+    "LLTN": int(os.getenv("ROLE_LLTN", "1540680280124162068")),
+    "MLTN": int(os.getenv("ROLE_MLTN", "1540680277037420604")),
+    "HLTN": int(os.getenv("ROLE_HLTN", "1540680273392308234")),
+    "LMTN": int(os.getenv("ROLE_LMTN", "1540680270192185464")),
+    "MMTN": int(os.getenv("ROLE_MMTN", "1540680267633786951")),
+    "HMTN": int(os.getenv("ROLE_HMTN", "1540680263389155400")),
+    "LHTN": int(os.getenv("ROLE_LHTN", "1540680260092297386")),
+    "MHTN": int(os.getenv("ROLE_MHTN", "1540680256912891934")),
+    "HHTN": int(os.getenv("ROLE_HHTN", "1540680253767421952")),
+    "Chadlite": int(os.getenv("ROLE_CHADLITE", "1540680250210390046")),
+    "Chad": int(os.getenv("ROLE_CHAD", "1540680246611939368")),
 }
 
 SCORE_SCALE_MAX = 10.0
