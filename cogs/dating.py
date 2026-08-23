@@ -395,13 +395,24 @@ class DatingCog(commands.Cog):
 
     async def get_weighted_candidate(self, user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT dating_pool, gender, age_group, location FROM users WHERE user_id = ?", (user_id,)) as c:
+            async with db.execute("""
+                SELECT u.dating_pool, u.gender, u.age_group, u.location, r.tier 
+                FROM users u 
+                LEFT JOIN rating_results r ON u.user_id = r.user_id 
+                WHERE u.user_id = ?
+            """, (user_id,)) as c:
                 user_row = await c.fetchone()
 
             if not user_row:
                 return None
 
             user_pool = user_row[0]
+            user_tier = user_row[4]
+            user_tier_idx = None
+            if user_tier in config.FEMALE_TIER_ORDER:
+                user_tier_idx = config.FEMALE_TIER_ORDER.index(user_tier)
+            elif user_tier in config.MALE_TIER_ORDER:
+                user_tier_idx = config.MALE_TIER_ORDER.index(user_tier)
 
             query = """
                 SELECT u.user_id, u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests,
@@ -432,7 +443,23 @@ class DatingCog(commands.Cog):
             cand_id = cand[0]
             if await validate_dating_contact(user_id, cand_id):
                 weight = 10
-                if cand[10]: weight += config.WEIGHT_ALREADY_LIKED
+
+                cand_tier = cand[8]
+                cand_tier_idx = None
+                if cand_tier in config.FEMALE_TIER_ORDER:
+                    cand_tier_idx = config.FEMALE_TIER_ORDER.index(cand_tier)
+                elif cand_tier in config.MALE_TIER_ORDER:
+                    cand_tier_idx = config.MALE_TIER_ORDER.index(cand_tier)
+
+                # Tier proximity weighting: matches with identical/close tier indices receive significantly higher weights
+                if user_tier_idx is not None and cand_tier_idx is not None:
+                    distance = abs(user_tier_idx - cand_tier_idx)
+                    tier_weight = max(1.0, 40.0 - (distance * 3.5))
+                    weight += tier_weight
+
+                if cand[10]:
+                    weight += config.WEIGHT_ALREADY_LIKED
+
                 valid_candidates.append((cand, weight))
 
         if not valid_candidates:
