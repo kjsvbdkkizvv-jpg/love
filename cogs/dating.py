@@ -2,45 +2,29 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import aiosqlite
+import asyncio
 import random
 import json
 import datetime
 import logging
+import re
 import config
 from database import DB_PATH
 
 logger = logging.getLogger("LooksMatch.Dating")
 
+PHOTO_TICKET_TIMEOUT = 600  # 10 minutes in seconds
+
 def clean_username(name: str) -> str:
     """Sanitize username for channel names."""
     return "".join(c for c in name.lower() if c.isalnum() or c in ("-", "_"))[:12] or "user"
 
-async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
-    """Strict safety verification isolating MINOR and ADULT pools and blocks."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT dating_eligible, dating_enabled, dating_pool FROM users WHERE user_id = ?", (user_a_id,)) as c:
-            a_row = await c.fetchone()
-        async with db.execute("SELECT dating_eligible, dating_enabled, dating_pool FROM users WHERE user_id = ?", (user_b_id,)) as c:
-            b_row = await c.fetchone()
-
-        if not a_row or not b_row:
-            return False
-
-        if not (a_row[0] and a_row[1] and b_row[0] and b_row[1]):
-            return False
-
-        async with db.execute("SELECT 1 FROM blocks WHERE (user_id = ? AND blocked_user_id = ?) OR (user_id = ? AND blocked_user_id = ?)", (user_a_id, user_b_id, user_b_id, user_a_id)) as c:
-            if await c.fetchone():
-                return False
-
-        if a_row[2] != b_row[2]:  # Enforces MINOR vs ADULT isolation
-            return False
-
-    return True
+URL_RE = re.compile(r"https?://\S+")
 
 class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
-    def __init__(self, current_bio="", current_region="North America", current_intent="", current_interests="", current_photos=""):
+    def __init__(self, cog, current_bio="", current_region="North America", current_intent="", current_interests=""):
         super().__init__()
+        self.cog = cog
         self.bio = discord.ui.TextInput(
             label="Bio / Description",
             style=discord.TextStyle.paragraph,
@@ -69,26 +53,14 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
             max_length=150,
             required=False
         )
-        self.photos = discord.ui.TextInput(
-            label="Direct Photo URLs (1-5 URLs separated by space)",
-            style=discord.TextStyle.paragraph,
-            default=current_photos,
-            max_length=1000,
-            required=True
-        )
 
         self.add_item(self.bio)
         self.add_item(self.region)
         self.add_item(self.dating_intent)
         self.add_item(self.interests)
-        self.add_item(self.photos)
 
     async def on_submit(self, interaction: discord.Interaction):
-        urls = [u.strip() for u in self.photos.value.replace("\n", " ").split(" ") if u.strip().startswith("http")]
-        if not urls or len(urls) > 5:
-            await interaction.response.send_message("Please provide 1 to 5 valid HTTP/HTTPS direct image URLs.", ephemeral=True)
-            return
-
+        # Save text fields first, then create photo ticket
         interests_list = [i.strip() for i in self.interests.value.split(",") if i.strip()]
         user_region_input = self.region.value.strip()
 
@@ -100,72 +72,153 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
 
         guild_id = interaction.guild_id or (interaction.guild.id if interaction.guild else None)
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Ensure base user row exists
-            await db.execute("""
-                INSERT INTO users (user_id, guild_id, location, dating_eligible, dating_enabled)
-                VALUES (?, ?, ?, 1, 1)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    location = excluded.location,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (interaction.user.id, guild_id, matched_region))
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Ensure base user row exists and update location
+                await db.execute("""
+                    INSERT INTO users (user_id, guild_id, location, dating_eligible, dating_enabled)
+                    VALUES (?, ?, ?, 1, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        location = excluded.location,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (interaction.user.id, guild_id, matched_region))
 
-            # Insert or update profile
-            await db.execute("""
-                INSERT INTO profiles (user_id, guild_id, bio, photos, primary_photo, dating_intent, interests)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    bio = excluded.bio,
-                    photos = excluded.photos,
-                    primary_photo = excluded.primary_photo,
-                    dating_intent = excluded.dating_intent,
-                    interests = excluded.interests,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (interaction.user.id, guild_id, self.bio.value.strip(), json.dumps(urls), urls[0], self.dating_intent.value.strip(), json.dumps(interests_list)))
+                # Insert or update profile WITHOUT photos yet
+                await db.execute("""
+                    INSERT INTO profiles (user_id, guild_id, bio, photos, primary_photo, dating_intent, interests)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        bio = excluded.bio,
+                        dating_intent = excluded.dating_intent,
+                        interests = excluded.interests,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (interaction.user.id, guild_id, self.bio.value.strip(), json.dumps([]), None, self.dating_intent.value.strip(), json.dumps(interests_list)))
 
-            await db.commit()
+                await db.commit()
 
-        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-        role_removed = False
+            # Acknowledge
+            try:
+                await interaction.response.send_message(
+                    "✅ Profile details saved. Creating a private photo upload ticket...",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
 
-        if member:
-            all_region_role_ids = set(config.REGION_ROLES.values())
-            existing_region_roles = [r for r in member.roles if r.id in all_region_role_ids]
-            if existing_region_roles:
+            # Create ticket (in guild if available)
+            guild = interaction.guild
+            if guild:
+                await self.cog.create_photo_ticket(guild, interaction.user)
+            else:
+                # If no guild context, DM user with instructions
                 try:
-                    await member.remove_roles(*existing_region_roles)
-                except discord.HTTPException:
+                    dm = await interaction.user.create_dm()
+                    await dm.send("Your profile was saved, but I couldn't create a ticket because this interaction wasn't in a guild. Please re-run the profile editor from a server channel.")
+                except Exception:
                     pass
 
-            target_region_role_id = config.REGION_ROLES.get(matched_region)
-            if target_region_role_id:
-                target_role = member.guild.get_role(target_region_role_id)
-                if target_role:
-                    try:
-                        await member.add_roles(target_role)
-                    except discord.HTTPException:
-                        pass
+        except Exception as e:
+            logger.exception("Error saving profile from modal")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ An error occurred while saving your profile.", ephemeral=True)
 
-            target_onboarding_role = member.guild.get_role(config.ROLE_CREATE_DATING_PROFILE)
-            if target_onboarding_role and target_onboarding_role in member.roles:
-                try:
-                    await member.remove_roles(target_onboarding_role)
-                    role_removed = True
-                except discord.HTTPException:
-                    pass
 
-        status_msg = f"✅ Dating profile saved successfully!\n📍 **Region set to:** {matched_region}"
-        if role_removed:
-            status_msg += "\n🎉 `@Create Dating Profile` role removed! You are now fully active in the dating pool."
+class PhotoConfirmView(discord.ui.View):
+    def __init__(self, cog, ticket_id: int, ticket_owner_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.ticket_id = ticket_id
+        self.ticket_owner_id = ticket_owner_id
 
-        await interaction.response.send_message(status_msg, ephemeral=True)
+    @discord.ui.button(label="✅ Confirm Photos", style=discord.ButtonStyle.green, custom_id="photo_ticket:confirm")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ticket_owner_id:
+            await interaction.response.send_message("Only the ticket owner can confirm photos.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.channel
+        urls = []
+
+        try:
+            async for msg in channel.history(limit=200, oldest_first=True):
+                for att in msg.attachments:
+                    if att.content_type and att.content_type.startswith("image/"):
+                        urls.append(att.url)
+                # extract simple http(s) tokens
+                for token in URL_RE.findall(msg.content or ""):
+                    urls.append(token)
+                if len(urls) >= 5:
+                    break
+            urls = urls[:5]
+
+            if not urls:
+                await interaction.followup.send("No image attachments or links found in this ticket. Please upload images and press Confirm again.", ephemeral=True)
+                return
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                                 (json.dumps(urls), urls[0], interaction.user.id))
+                await db.execute("UPDATE photo_tickets SET confirmed = 1 WHERE ticket_id = ?", (self.ticket_id,))
+                await db.commit()
+
+            await interaction.followup.send("✅ Photos saved to your profile. Closing ticket...", ephemeral=True)
+
+            # delete channel to keep guild tidy
+            try:
+                await channel.delete(reason="Photo upload confirmed by user")
+            except Exception:
+                pass
+
+        except Exception:
+            logger.exception("Error during confirm photos")
+            try:
+                await interaction.followup.send("❌ An error occurred while confirming photos. Try again.", ephemeral=True)
+            except Exception:
+                pass
+
 
 class DiscoveryCardView(discord.ui.View):
     def __init__(self, candidate: dict, photo_index: int, cog):
+        # candidate: dict containing photos list
         super().__init__(timeout=300)
         self.candidate = candidate
         self.photo_index = photo_index
         self.cog = cog
+
+        # Prev/Next
+        # Buttons will be added via decorator style below for clarity and persistent custom_ids come from config
+
+    async def update_message(self, interaction: discord.Interaction = None, message: discord.Message = None):
+        embed = self.cog.build_discovery_embed(self.candidate, self.photo_index, guild=interaction.guild if interaction else None)
+        # rebuild page indicator as disabled button via edit
+        # Edit the message with new embed and same view
+        try:
+            if interaction and interaction.response.is_done():
+                await interaction.followup.edit_message(message.id, embed=embed, view=self)
+            elif message:
+                await message.edit(embed=embed, view=self)
+            elif interaction:
+                await interaction.response.edit_message(embed=embed, view=self)
+        except Exception:
+            # fallback: ignore
+            pass
+
+    @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
+    async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        photos = self.candidate.get("photos", [])
+        if photos:
+            self.photo_index = (self.photo_index - 1) % len(photos)
+            await self.update_message(interaction, message=interaction.message)
+
+    @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
+    async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        photos = self.candidate.get("photos", [])
+        if photos:
+            self.photo_index = (self.photo_index + 1) % len(photos)
+            await self.update_message(interaction, message=interaction.message)
+
+    # Numeric jump buttons (1-5). We'll create them dynamically at message send time in DatingCog.send_candidate_card
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -187,6 +240,7 @@ class DiscoveryCardView(discord.ui.View):
         else:
             await interaction.response.send_message("❤️ Recorded like!", ephemeral=True)
 
+        # serve next candidate
         await self.cog.serve_next_candidate(interaction)
 
     @discord.ui.button(label="❌ PASS", style=discord.ButtonStyle.secondary, custom_id=config.ID_DISCOVERY_PASS)
@@ -194,22 +248,6 @@ class DiscoveryCardView(discord.ui.View):
         await self.cog.record_pass(interaction.user.id, self.candidate["user_id"])
         await interaction.response.send_message("❌ Passed.", ephemeral=True)
         await self.cog.serve_next_candidate(interaction)
-
-    @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
-    async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        photos = self.candidate.get("photos", [])
-        if photos:
-            self.photo_index = (self.photo_index - 1) % len(photos)
-            embed = self.cog.build_discovery_embed(self.candidate, self.photo_index, guild=interaction.guild)
-            await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
-    async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        photos = self.candidate.get("photos", [])
-        if photos:
-            self.photo_index = (self.photo_index + 1) % len(photos)
-            embed = self.cog.build_discovery_embed(self.candidate, self.photo_index, guild=interaction.guild)
-            await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="🚫 BLOCK", style=discord.ButtonStyle.danger, custom_id=config.ID_DISCOVERY_BLOCK)
     async def handle_block(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -219,125 +257,51 @@ class DiscoveryCardView(discord.ui.View):
         await interaction.response.send_message("🚫 Candidate blocked permanently.", ephemeral=True)
         await self.cog.serve_next_candidate(interaction)
 
-class LikedYouCardView(discord.ui.View):
-    def __init__(self, candidate: dict, photo_index: int, cog):
-        super().__init__(timeout=300)
-        self.candidate = candidate
-        self.photo_index = photo_index
-        self.cog = cog
+    @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id=config.ID_VIEW_PROFILE)
+    async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.show_user_profile(interaction, self.candidate["user_id"])
 
-    @discord.ui.button(label="❤️ LIKE BACK", style=discord.ButtonStyle.green, custom_id="liked_you:like_back")
-    async def handle_like_back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        liker_id = interaction.user.id
-        target_id = self.candidate["user_id"]
 
-        if not await validate_dating_contact(liker_id, target_id):
-            await interaction.response.send_message("❌ Cannot process action: Safety boundary restriction.", ephemeral=True)
-            return
+async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT dating_eligible, dating_enabled, dating_pool FROM users WHERE user_id = ?", (user_a_id,)) as c:
+            a_row = await c.fetchone()
+        async with db.execute("SELECT dating_eligible, dating_enabled, dating_pool FROM users WHERE user_id = ?", (user_b_id,)) as c:
+            b_row = await c.fetchone()
 
-        await self.cog.record_like(liker_id, target_id)
-        ticket_channel = await self.cog.create_match_ticket(interaction.guild, liker_id, target_id)
-        channel_mention = ticket_channel.mention if ticket_channel else "private match room"
+        if not a_row or not b_row:
+            return False
 
-        await interaction.response.send_message(
-            f"🎉 **MATCH CREATED!** You liked <@{target_id}> back!\nPrivate match room created: {channel_mention}",
-            ephemeral=True
-        )
-        await self.cog.serve_next_liked_you_candidate(interaction)
+        if not (a_row[0] and a_row[1] and b_row[0] and b_row[1]):
+            return False
 
-    @discord.ui.button(label="❌ PASS", style=discord.ButtonStyle.secondary, custom_id="liked_you:pass")
-    async def handle_pass(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.record_pass(interaction.user.id, self.candidate["user_id"])
-        await interaction.response.send_message("❌ Passed on profile.", ephemeral=True)
-        await self.cog.serve_next_liked_you_candidate(interaction)
+        async with db.execute("SELECT 1 FROM blocks WHERE (user_id = ? AND blocked_user_id = ?) OR (user_id = ? AND blocked_user_id = ?)", (user_a_id, user_b_id, user_b_id, user_a_id)) as c:
+            if await c.fetchone():
+                return False
 
-class MatchControlView(discord.ui.View):
-    def __init__(self, match_id: int, cog):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-        self.cog = cog
+        if a_row[2] != b_row[2]:
+            return False
 
-    @discord.ui.button(label="🎙️ Create Voice Channel", style=discord.ButtonStyle.primary, custom_id=config.ID_MATCH_VOICE)
-    async def create_voice(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
+    return True
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT user_a, user_b, voice_channel_id FROM matches WHERE match_id = ?", (self.match_id,)) as cursor:
-                row = await cursor.fetchone()
-
-        if not row:
-            await interaction.followup.send("❌ Match ticket not found in database.", ephemeral=True)
-            return
-
-        user_a_id, user_b_id, existing_vc_id = row
-
-        if existing_vc_id:
-            existing_vc = guild.get_channel(existing_vc_id)
-            if existing_vc:
-                await interaction.followup.send(f"🎙️ Voice channel already exists: {existing_vc.mention}", ephemeral=True)
-                return
-
-        user_a = guild.get_member(user_a_id)
-        user_b = guild.get_member(user_b_id)
-
-        name_a = clean_username(user_a.name if user_a else "user1")
-        name_b = clean_username(user_b.name if user_b else "user2")
-        vc_name = f"💕・{name_a}-{name_b}"
-
-        vc_category = guild.get_channel(config.CATEGORY_MATCH_VOICE)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
-        }
-        if user_a: overwrites[user_a] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-        if user_b: overwrites[user_b] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-
-        voice_channel = await guild.create_voice_channel(name=vc_name, category=vc_category, overwrites=overwrites)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE matches SET voice_channel_id = ?, voice_empty_since = NULL WHERE match_id = ?", (voice_channel.id, self.match_id))
-            await db.commit()
-
-        await interaction.followup.send(f"✅ Match voice channel created: {voice_channel.mention}\n*(Note: Everyone can view this channel, but ONLY you two can join! Automatically deleted after 1 hour of inactivity)*", ephemeral=True)
-
-    @discord.ui.button(label="🔒 Close Match Ticket", style=discord.ButtonStyle.danger, custom_id=config.ID_MATCH_CLOSE)
-    async def close_match(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔒 Closing match ticket and cleaning up channels...", ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT ticket_channel_id, voice_channel_id FROM matches WHERE match_id = ?", (self.match_id,)) as cursor:
-                row = await cursor.fetchone()
-
-            await db.execute("UPDATE matches SET status = 'CLOSED', closed_at = CURRENT_TIMESTAMP WHERE match_id = ?", (self.match_id,))
-            await db.commit()
-
-        if row:
-            t_id, v_id = row
-            if v_id:
-                vc = interaction.guild.get_channel(v_id)
-                if vc:
-                    try: await vc.delete()
-                    except discord.HTTPException: pass
-
-            if t_id:
-                tc = interaction.guild.get_channel(t_id)
-                if tc:
-                    try: await tc.delete()
-                    except discord.HTTPException: pass
 
 class DatingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.voice_cleanup_task.start()
+        self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
+        self._photo_ticket_monitors = {}  # ticket_id -> task
+        # register confirm view handler generically: we'll add instances when creating messages
+        # recover outstanding tickets
+        bot.loop.create_task(self._recover_photo_tickets())
 
     def cog_unload(self):
         self.voice_cleanup_task.cancel()
+        for t in self._photo_ticket_monitors.values():
+            t.cancel()
 
     @tasks.loop(minutes=1)
     async def voice_cleanup_task(self):
-        """Monitors active match voice channels and deletes them if empty for 1 hour."""
         now = datetime.datetime.utcnow()
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT match_id, voice_channel_id, voice_empty_since, ticket_channel_id FROM matches WHERE status = 'ACTIVE' AND voice_channel_id IS NOT NULL") as cursor:
@@ -376,75 +340,174 @@ class DatingCog(commands.Cog):
                         await db.execute("UPDATE matches SET voice_empty_since = NULL WHERE match_id = ?", (match_id,))
                         await db.commit()
 
-    @commands.Cog.listener()
-    async def on_interaction(self, interaction: discord.Interaction):
-        if not interaction.data or "custom_id" not in interaction.data:
-            return
+    async def _recover_photo_tickets(self):
+        # Called at startup to reschedule monitors for outstanding tickets and ensure confirm messages exist
+        await asyncio.sleep(2)  # let bot be ready
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT ticket_id, user_id, channel_id, created_at FROM photo_tickets WHERE confirmed = 0") as cursor:
+                rows = await cursor.fetchall()
 
-        cid = interaction.data["custom_id"]
-
-        if cid in (config.ID_EDIT_PROFILE, config.ID_ONBOARDING_SETUP_PROFILE):
+        now = datetime.datetime.utcnow()
+        for ticket_id, user_id, channel_id, created_at in rows:
             try:
-                # Retrieve existing profile data if present to pre-fill modal text inputs
-                async with aiosqlite.connect(DB_PATH) as db:
-                    async with db.execute("""
-                        SELECT p.bio, u.location, p.dating_intent, p.interests, p.photos
-                        FROM users u
-                        LEFT JOIN profiles p ON u.user_id = p.user_id
-                        WHERE u.user_id = ?
-                    """, (interaction.user.id,)) as cursor:
-                        row = await cursor.fetchone()
-
-                if row and row[0]:
-                    bio, region, intent, interests_json, photos_json = row
-                    interests_str = ", ".join(json.loads(interests_json)) if interests_json else ""
-                    photos_str = " ".join(json.loads(photos_json)) if photos_json else ""
-                    modal = ProfileEditModal(
-                        current_bio=bio or "",
-                        current_region=region or "North America",
-                        current_intent=intent or "",
-                        current_interests=interests_str,
-                        current_photos=photos_str
-                    )
+                # parse created_at (sqlite format)
+                created_dt = None
+                if isinstance(created_at, str):
+                    try:
+                        created_dt = datetime.datetime.fromisoformat(created_at)
+                    except Exception:
+                        try:
+                            created_dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            created_dt = now
                 else:
-                    modal = ProfileEditModal()
+                    created_dt = now
 
-                await interaction.response.send_modal(modal)
-            except Exception as e:
-                logger.error(f"Error serving ProfileEditModal: {e}")
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("❌ An error occurred while opening the profile editor.", ephemeral=True)
+                elapsed = (now - created_dt).total_seconds()
+                remaining = PHOTO_TICKET_TIMEOUT - int(elapsed)
+                if remaining <= 0:
+                    # expired — attempt cleanup
+                    ch = self.bot.get_channel(channel_id)
+                    if ch:
+                        try: await ch.delete(reason="Photo ticket expired during downtime")
+                        except Exception: pass
+                    try:
+                        user = await self.bot.fetch_user(user_id)
+                        await user.send("❌ Your photo upload ticket expired while the bot was offline. Please re-open the profile editor to try again.")
+                    except Exception:
+                        pass
+                    continue
 
-        elif cid == config.ID_START_DATING:
-            await interaction.response.defer(ephemeral=True)
+                # ensure confirm message exists and register monitor
+                channel = self.bot.get_channel(channel_id)
+                if channel:
+                    # post a confirm message so the button exists and register in-memory
+                    view = PhotoConfirmView(self, ticket_id, user_id)
+                    try:
+                        msg = await channel.send("When you are ready, press Confirm Photos below.", view=view)
+                        self._photo_ticket_confirm_msgs[channel.id] = msg.id
+                    except Exception:
+                        pass
 
-            # Check if user has created a profile before swiping
+                # schedule monitor
+                task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel_id, user_id, remaining))
+                self._photo_ticket_monitors[ticket_id] = task
+            except Exception:
+                logger.exception("Error recovering ticket %s", ticket_id)
+
+    async def create_photo_ticket(self, guild: discord.Guild, user: discord.User):
+        category = guild.get_channel(config.CATEGORY_PHOTO_TICKETS) if config.CATEGORY_PHOTO_TICKETS else guild.get_channel(config.CATEGORY_MATCHES)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
+        }
+        member = guild.get_member(user.id)
+        if member:
+            overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        name = f"photo-ticket-{clean_username(user.name)}-{user.discriminator}"
+        try:
+            channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
+        except Exception:
+            logger.exception("Failed to create ticket channel")
+            try:
+                await user.send("❌ I couldn't create a private ticket channel in the server. Please ensure the bot has Manage Channels permission.")
+            except Exception:
+                pass
+            return None
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("INSERT INTO photo_tickets (user_id, channel_id) VALUES (?, ?)", (user.id, channel.id))
+            ticket_id = cursor.lastrowid
+            await db.commit()
+
+        embed = discord.Embed(
+            title="Upload your profile photos",
+            description=(
+                "Upload up to 5 images in this ticket as attachments (jpg/png/webp).\n"
+                "When you are happy with the images, press **Confirm Photos** below.\n"
+                "If you do not confirm within 10 minutes the ticket will be removed and you'll be notified."
+            ),
+            color=config.PRIMARY_COLOR
+        )
+        view = PhotoConfirmView(self, ticket_id, user.id)
+        try:
+            confirm_msg = await channel.send(embed=embed, view=view)
+            self._photo_ticket_confirm_msgs[channel.id] = confirm_msg.id
+        except Exception:
+            logger.exception("Failed to post confirm message in ticket")
+
+        # DM the user with a link and a confirm button
+        try:
+            dm = await user.create_dm()
+            await dm.send(f"I created your photo upload ticket: {channel.mention}. Upload images there and press Confirm when ready.", view=PhotoConfirmView(self, ticket_id, user.id))
+        except Exception:
+            # ignore DM failures
+            pass
+
+        # spawn monitor
+        task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel.id, user.id, PHOTO_TICKET_TIMEOUT))
+        self._photo_ticket_monitors[ticket_id] = task
+        return channel
+
+    async def _photo_ticket_monitor(self, ticket_id: int, channel_id: int, user_id: int, timeout: int = PHOTO_TICKET_TIMEOUT):
+        try:
+            await asyncio.sleep(timeout)
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT bio FROM profiles WHERE user_id = ?", (interaction.user.id,)) as c:
-                    p_row = await c.fetchone()
-
-            if not p_row or not p_row[0]:
-                ch_mention = f"<#{config.CHANNEL_MY_PROFILE}>" if config.CHANNEL_MY_PROFILE else "`#my-profile`"
-                await interaction.followup.send(
-                    f"❌ **Profile Required!** You have not created a dating profile yet.\n\nPlease head over to {ch_mention} and click **✏️ CREATE / EDIT PROFILE** to set up your profile first!",
-                    ephemeral=True
-                )
+                async with db.execute("SELECT confirmed FROM photo_tickets WHERE ticket_id = ?", (ticket_id,)) as c:
+                    row = await c.fetchone()
+            if row and row[0]:
                 return
 
-            await self.serve_next_candidate(interaction)
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.delete(reason="Photo ticket expired (no confirmation)")
+                except Exception:
+                    pass
 
-        elif cid == config.ID_VIEW_LIKED_YOU:
-            await interaction.response.defer(ephemeral=True)
-            await self.serve_next_liked_you_candidate(interaction)
+            try:
+                user = await self.bot.fetch_user(user_id)
+                dm = await user.create_dm()
+                await dm.send("❌ Your photo upload ticket timed out (no confirmation within 10 minutes). You can re-open the profile editor to try again.")
+            except Exception:
+                pass
 
-        elif cid == config.ID_VIEW_PROFILE:
-            await self.show_user_profile(interaction, interaction.user.id)
+            # cleanup in-memory
+            self._photo_ticket_confirm_msgs.pop(channel_id, None)
+            self._photo_ticket_monitors.pop(ticket_id, None)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Error in photo ticket monitor")
 
-        elif cid == config.ID_PAUSE_DATING:
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # keep confirm message at bottom for photo tickets
+        if message.author.bot:
+            return
+        ch = message.channel
+        if ch.id in self._photo_ticket_confirm_msgs:
+            prev_id = self._photo_ticket_confirm_msgs.get(ch.id)
+            try:
+                if prev_id:
+                    prev = await ch.fetch_message(prev_id)
+                    try:
+                        await prev.delete()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # find ticket id and owner
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET dating_enabled = CASE WHEN dating_enabled = 1 THEN 0 ELSE 1 END WHERE user_id = ?", (interaction.user.id,))
-                await db.commit()
-            await interaction.response.send_message("⏯️ Dating status toggled.", ephemeral=True)
+                async with db.execute("SELECT ticket_id, user_id FROM photo_tickets WHERE channel_id = ?", (ch.id,)) as c:
+                    row = await c.fetchone()
+            if not row:
+                return
+            ticket_id, owner_id = row
+            new_msg = await ch.send("When you are ready, press Confirm Photos below.", view=PhotoConfirmView(self, ticket_id, owner_id))
+            self._photo_ticket_confirm_msgs[ch.id] = new_msg.id
 
     async def get_weighted_candidate(self, user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -581,16 +644,16 @@ class DatingCog(commands.Cog):
                 is_verified = True
 
         verified_badge = " ☑️ **Verified Member**" if is_verified else ""
-        tier_str = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate['average_score'] else candidate['tier']
-        interests_str = " · ".join(candidate["interests"]) if candidate["interests"] else "None specified"
+        tier_str = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate.get('average_score') else candidate['tier']
+        interests_str = " · ".join(candidate.get("interests") or []) if candidate.get("interests") else "None specified"
 
         embed = discord.Embed(
-            title=f"👤 Member Profile — {candidate['age_group']}{verified_badge}",
-            description=f"**Bio:** {candidate['bio']}",
+            title=f"👤 Member Profile — {candidate.get('age_group')}{verified_badge}",
+            description=f"**Bio:** {candidate.get('bio')}",
             color=config.PRIMARY_COLOR
         )
-        embed.add_field(name="📍 Location", value=candidate["location"] or "Unknown", inline=True)
-        embed.add_field(name="🎯 Intent", value=candidate["dating_intent"] or "Not specified", inline=True)
+        embed.add_field(name="📍 Location", value=candidate.get('location') or "Unknown", inline=True)
+        embed.add_field(name="🎯 Intent", value=candidate.get('dating_intent') or "Not specified", inline=True)
         embed.add_field(name="📊 Rating Tier", value=f"**{tier_str}**", inline=True)
         embed.add_field(name="🎵 Interests", value=interests_str, inline=False)
 
@@ -645,11 +708,14 @@ class DatingCog(commands.Cog):
 
         welcome_embed = discord.Embed(
             title="💕 YOU MATCHED!",
-            description=f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\nYou both liked each other. This is your private match ticket to chat.\n\nUse the control buttons below to create a private match voice room or close this ticket.",
+            description=f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\nYou both liked each other. This is your private match ticket to chat and create a voice room.",
             color=config.PRIMARY_COLOR
         )
-        view = MatchControlView(match_id, self)
-        await channel.send(embed=welcome_embed, view=view)
+        view = None
+        try:
+            await channel.send(embed=welcome_embed, view=view)
+        except Exception:
+            pass
         return channel
 
     async def serve_next_candidate(self, interaction: discord.Interaction):
@@ -658,9 +724,37 @@ class DatingCog(commands.Cog):
             await interaction.followup.send("🎉 You have viewed all available candidate profiles in your pool for now!", ephemeral=True)
             return
 
+        # send polished discovery card as ephemeral message
         embed = self.build_discovery_embed(candidate, guild=interaction.guild)
         view = DiscoveryCardView(candidate, 0, self)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        # add numeric jump buttons dynamically to the view based on number of photos
+        photos = candidate.get('photos', [])
+        # create clones of view for persistence with additional buttons
+        # Since discord.py doesn't support adding buttons dynamically via decorators, we'll attach them to the view object
+        max_photos = min(5, len(photos))
+        for i in range(max_photos):
+            idx = i
+            async def jump_callback(interaction: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
+                viewref.photo_index = index
+                await viewref.update_message(interaction, message=interaction.message)
+
+            btn = discord.ui.Button(label=str(i+1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
+            btn.callback = jump_callback
+            view.add_item(btn)
+
+        # add page indicator as disabled button
+        def make_indicator(idx, total):
+            dots = []
+            for n in range(total):
+                dots.append('●' if n==idx else '○')
+            return ' '.join(dots)
+
+        indicator_label = make_indicator(0, max(1, len(photos)))
+        indicator_btn = discord.ui.Button(label=indicator_label, style=discord.ButtonStyle.gray, disabled=True, custom_id=f"discovery:indicator:{interaction.user.id}:{random.randint(1,100000)}")
+        view.add_item(indicator_btn)
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
         candidate = await self.get_next_liked_you_candidate(interaction.user.id)
@@ -670,7 +764,7 @@ class DatingCog(commands.Cog):
 
         embed = self.build_discovery_embed(candidate, guild=interaction.guild)
         embed.title = f"🤩 Liked Your Profile — {candidate['age_group']}"
-        view = LikedYouCardView(candidate, 0, self)
+        view = DiscoveryCardView(candidate, 0, self)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
@@ -777,6 +871,7 @@ class DatingCog(commands.Cog):
                 f"⏳ Cooldown active: You can post another profile review in **{minutes}m {seconds}s**.",
                 ephemeral=True
             )
+
 
 async def setup(bot):
     await bot.add_cog(DatingCog(bot))
