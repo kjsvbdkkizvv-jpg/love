@@ -6,7 +6,7 @@ load_dotenv()
 
 # Bot Authentication Token & Database Path
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "looksmatch.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/looksmatch.db")
 
 # Theme Color Configuration (#794162)
 PRIMARY_COLOR = discord.Color.from_str("#794162")
@@ -24,6 +24,9 @@ CHANNEL_PROFILE_CHECK = int(os.getenv("CHANNEL_PROFILE_CHECK", "1541043286280642
 CHANNEL_CONFESSIONS = int(os.getenv("CHANNEL_CONFESSIONS", "1541044196956438538"))
 CHANNEL_CONFESSION_LOGS = int(os.getenv("CHANNEL_CONFESSION_LOGS", "1541065281613336636"))
 CHANNEL_SERVER_STATS = int(os.getenv("CHANNEL_SERVER_STATS", "1541065478502613043"))
+
+# Photo ticket category (where private upload tickets are created). Falls back to CATEGORY_MATCHES if unset.
+CATEGORY_PHOTO_TICKETS = int(os.getenv("CATEGORY_PHOTO_TICKETS", "1541038079920443462"))
 
 # Roles
 ROLE_OWNER = int(os.getenv("ROLE_OWNER", "1540666072154382406"))
