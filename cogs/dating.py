@@ -114,9 +114,15 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
         self.add_item(self.interests)
 
     async def on_submit(self, interaction: discord.Interaction):
-        """Save text-only profile fields, then create a private photo ticket channel in the guild."""
+        # immediately tell Discord we will handle this (gives us more time for DB and channel ops)
+        await interaction.response.defer(ephemeral=True)
+
         interests_list = [i.strip() for i in self.interests.value.split(",") if i.strip()]
         user_region_input = self.region.value.strip()
+
+        # (rest of existing code follows — and change any interaction.response.send_message(...) that occurs after the defer
+        # to interaction.followup.send(...)
+        
 
         matched_region = "Other"
         for reg_key in config.REGION_ROLES.keys():
