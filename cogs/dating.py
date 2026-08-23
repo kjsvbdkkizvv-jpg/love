@@ -5,8 +5,11 @@ import aiosqlite
 import random
 import json
 import datetime
+import logging
 import config
 from database import DB_PATH
+
+logger = logging.getLogger("LooksMatch.Dating")
 
 def clean_username(name: str) -> str:
     """Sanitize username for channel names."""
@@ -35,47 +38,50 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
 
     return True
 
-class PreferencesModal(discord.ui.Modal, title="Matching Preferences"):
-    min_age = discord.ui.TextInput(label="Minimum Age", placeholder="18", default="18", min_length=2, max_length=2)
-    max_age = discord.ui.TextInput(label="Maximum Age", placeholder="99", default="99", min_length=2, max_length=2)
-    genders = discord.ui.TextInput(label="Preferred Genders (Comma-separated)", placeholder="Woman, Man", default="Woman, Man", max_length=100)
+class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
+    def __init__(self, current_bio="", current_region="North America", current_intent="", current_interests="", current_photos=""):
+        super().__init__()
+        self.bio = discord.ui.TextInput(
+            label="Bio / Description",
+            style=discord.TextStyle.paragraph,
+            default=current_bio,
+            max_length=500,
+            required=True
+        )
+        self.region = discord.ui.TextInput(
+            label="Region / Location",
+            placeholder="North America, Europe, Asia, Oceania, South America, Africa",
+            default=current_region or "North America",
+            max_length=50,
+            required=True
+        )
+        self.dating_intent = discord.ui.TextInput(
+            label="Dating Intention",
+            placeholder="Long-term relationship, casual...",
+            default=current_intent,
+            max_length=100,
+            required=True
+        )
+        self.interests = discord.ui.TextInput(
+            label="Interests (Comma-separated)",
+            placeholder="Music, Travel, Fitness",
+            default=current_interests,
+            max_length=150,
+            required=False
+        )
+        self.photos = discord.ui.TextInput(
+            label="Direct Photo URLs (1-5 URLs separated by space)",
+            style=discord.TextStyle.paragraph,
+            default=current_photos,
+            max_length=1000,
+            required=True
+        )
 
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            min_a = int(self.min_age.value)
-            max_a = int(self.max_age.value)
-        except ValueError:
-            await interaction.response.send_message("Invalid age inputs.", ephemeral=True)
-            return
-
-        g_list = [g.strip() for g in self.genders.value.split(",") if g.strip()]
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                INSERT INTO preferences (user_id, min_age, max_age, preferred_genders)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    min_age = excluded.min_age,
-                    max_age = excluded.max_age,
-                    preferred_genders = excluded.preferred_genders,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (interaction.user.id, min_a, max_a, json.dumps(g_list)))
-            await db.commit()
-
-        await interaction.response.send_message("✅ Matching preferences saved!", ephemeral=True)
-
-class ProfileEditModal(discord.ui.Modal, title="Edit Dating Profile"):
-    bio = discord.ui.TextInput(label="Bio / Description", style=discord.TextStyle.paragraph, max_length=500, required=True)
-    region = discord.ui.TextInput(
-        label="Region / Location",
-        placeholder="North America, Europe, Asia / Oceania, South America, Other",
-        default="North America",
-        max_length=50,
-        required=True
-    )
-    dating_intent = discord.ui.TextInput(label="Dating Intention", placeholder="Long-term relationship, casual...", max_length=100, required=True)
-    interests = discord.ui.TextInput(label="Interests (Comma-separated)", placeholder="Music, Travel, Fitness", max_length=150, required=False)
-    photos = discord.ui.TextInput(label="Direct Photo URLs (1-5 URLs separated by space)", style=discord.TextStyle.paragraph, max_length=1000, required=True)
+        self.add_item(self.bio)
+        self.add_item(self.region)
+        self.add_item(self.dating_intent)
+        self.add_item(self.interests)
+        self.add_item(self.photos)
 
     async def on_submit(self, interaction: discord.Interaction):
         urls = [u.strip() for u in self.photos.value.replace("\n", " ").split(" ") if u.strip().startswith("http")]
@@ -95,6 +101,16 @@ class ProfileEditModal(discord.ui.Modal, title="Edit Dating Profile"):
         guild_id = interaction.guild_id or (interaction.guild.id if interaction.guild else None)
 
         async with aiosqlite.connect(DB_PATH) as db:
+            # Ensure base user row exists
+            await db.execute("""
+                INSERT INTO users (user_id, guild_id, location, dating_eligible, dating_enabled)
+                VALUES (?, ?, ?, 1, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    location = excluded.location,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (interaction.user.id, guild_id, matched_region))
+
+            # Insert or update profile
             await db.execute("""
                 INSERT INTO profiles (user_id, guild_id, bio, photos, primary_photo, dating_intent, interests)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -106,10 +122,6 @@ class ProfileEditModal(discord.ui.Modal, title="Edit Dating Profile"):
                     interests = excluded.interests,
                     updated_at = CURRENT_TIMESTAMP
             """, (interaction.user.id, guild_id, self.bio.value.strip(), json.dumps(urls), urls[0], self.dating_intent.value.strip(), json.dumps(interests_list)))
-
-            await db.execute("""
-                UPDATE users SET location = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?
-            """, (matched_region, interaction.user.id))
 
             await db.commit()
 
@@ -142,7 +154,7 @@ class ProfileEditModal(discord.ui.Modal, title="Edit Dating Profile"):
                 except discord.HTTPException:
                     pass
 
-        status_msg = f"✅ Dating profile updated successfully!\n📍 **Region set to:** {matched_region}"
+        status_msg = f"✅ Dating profile saved successfully!\n📍 **Region set to:** {matched_region}"
         if role_removed:
             status_msg += "\n🎉 `@Create Dating Profile` role removed! You are now fully active in the dating pool."
 
@@ -275,7 +287,6 @@ class MatchControlView(discord.ui.View):
 
         vc_category = guild.get_channel(config.CATEGORY_MATCH_VOICE)
 
-        # Permissions: Everyone can VIEW, but ONLY user1 & user2 can CONNECT/SPEAK
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
@@ -335,19 +346,17 @@ class DatingCog(commands.Cog):
             for match_id, vc_id, empty_since_str, ticket_id in active_vcs:
                 channel = self.bot.get_channel(vc_id)
                 if not channel:
-                    # Voice channel was manually deleted
                     await db.execute("UPDATE matches SET voice_channel_id = NULL, voice_empty_since = NULL WHERE match_id = ?", (match_id,))
                     await db.commit()
                     continue
 
                 if len(channel.members) == 0:
                     if not empty_since_str:
-                        # Mark empty start time
                         await db.execute("UPDATE matches SET voice_empty_since = ? WHERE match_id = ?", (now.isoformat(), match_id))
                         await db.commit()
                     else:
                         empty_start = datetime.datetime.fromisoformat(empty_since_str)
-                        if (now - empty_start).total_seconds() >= 3600:  # 1 hour empty
+                        if (now - empty_start).total_seconds() >= 3600:
                             try:
                                 await channel.delete()
                             except discord.HTTPException:
@@ -363,7 +372,6 @@ class DatingCog(commands.Cog):
                                 except discord.HTTPException:
                                     pass
                 else:
-                    # Voice channel currently has active members
                     if empty_since_str:
                         await db.execute("UPDATE matches SET voice_empty_since = NULL WHERE match_id = ?", (match_id,))
                         await db.commit()
@@ -376,17 +384,62 @@ class DatingCog(commands.Cog):
         cid = interaction.data["custom_id"]
 
         if cid in (config.ID_EDIT_PROFILE, config.ID_ONBOARDING_SETUP_PROFILE):
-            await interaction.response.send_modal(ProfileEditModal())
+            try:
+                # Retrieve existing profile data if present to pre-fill modal text inputs
+                async with aiosqlite.connect(DB_PATH) as db:
+                    async with db.execute("""
+                        SELECT p.bio, u.location, p.dating_intent, p.interests, p.photos
+                        FROM users u
+                        LEFT JOIN profiles p ON u.user_id = p.user_id
+                        WHERE u.user_id = ?
+                    """, (interaction.user.id,)) as cursor:
+                        row = await cursor.fetchone()
+
+                if row and row[0]:
+                    bio, region, intent, interests_json, photos_json = row
+                    interests_str = ", ".join(json.loads(interests_json)) if interests_json else ""
+                    photos_str = " ".join(json.loads(photos_json)) if photos_json else ""
+                    modal = ProfileEditModal(
+                        current_bio=bio or "",
+                        current_region=region or "North America",
+                        current_intent=intent or "",
+                        current_interests=interests_str,
+                        current_photos=photos_str
+                    )
+                else:
+                    modal = ProfileEditModal()
+
+                await interaction.response.send_modal(modal)
+            except Exception as e:
+                logger.error(f"Error serving ProfileEditModal: {e}")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ An error occurred while opening the profile editor.", ephemeral=True)
+
         elif cid == config.ID_START_DATING:
             await interaction.response.defer(ephemeral=True)
+
+            # Check if user has created a profile before swiping
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT bio FROM profiles WHERE user_id = ?", (interaction.user.id,)) as c:
+                    p_row = await c.fetchone()
+
+            if not p_row or not p_row[0]:
+                ch_mention = f"<#{config.CHANNEL_MY_PROFILE}>" if config.CHANNEL_MY_PROFILE else "`#my-profile`"
+                await interaction.followup.send(
+                    f"❌ **Profile Required!** You have not created a dating profile yet.\n\nPlease head over to {ch_mention} and click **✏️ CREATE / EDIT PROFILE** to set up your profile first!",
+                    ephemeral=True
+                )
+                return
+
             await self.serve_next_candidate(interaction)
+
         elif cid == config.ID_VIEW_LIKED_YOU:
             await interaction.response.defer(ephemeral=True)
             await self.serve_next_liked_you_candidate(interaction)
+
         elif cid == config.ID_VIEW_PROFILE:
             await self.show_user_profile(interaction, interaction.user.id)
-        elif cid == config.ID_PREFERENCES:
-            await interaction.response.send_modal(PreferencesModal())
+
         elif cid == config.ID_PAUSE_DATING:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE users SET dating_enabled = CASE WHEN dating_enabled = 1 THEN 0 ELSE 1 END WHERE user_id = ?", (interaction.user.id,))
@@ -451,7 +504,6 @@ class DatingCog(commands.Cog):
                 elif cand_tier in config.MALE_TIER_ORDER:
                     cand_tier_idx = config.MALE_TIER_ORDER.index(cand_tier)
 
-                # Tier proximity weighting: matches with identical/close tier indices receive significantly higher weights
                 if user_tier_idx is not None and cand_tier_idx is not None:
                     distance = abs(user_tier_idx - cand_tier_idx)
                     tier_weight = max(1.0, 40.0 - (distance * 3.5))
@@ -522,7 +574,6 @@ class DatingCog(commands.Cog):
         photos = candidate.get("photos", [])
         photo_url = photos[photo_index] if photos else None
 
-        # Check for Verified Role
         is_verified = False
         if guild:
             member = guild.get_member(candidate["user_id"])
@@ -634,8 +685,15 @@ class DatingCog(commands.Cog):
             """, (target_id,)) as cursor:
                 row = await cursor.fetchone()
 
-        if not row:
-            await interaction.response.send_message("❌ Profile not found.", ephemeral=True)
+        if not row or not row[3]:
+            ch_mention = f"<#{config.CHANNEL_MY_PROFILE}>" if config.CHANNEL_MY_PROFILE else "`#my-profile`"
+            if target_id == interaction.user.id:
+                await interaction.response.send_message(
+                    f"❌ You have not created a profile yet! Please go to {ch_mention} and click **✏️ CREATE / EDIT PROFILE**.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message("❌ This member has not created a dating profile yet.", ephemeral=True)
             return
 
         photos = json.loads(row[4]) if row[4] else []
