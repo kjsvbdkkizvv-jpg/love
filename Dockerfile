@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-Create directory for persistent SQLite storage
+# Create directory for persistent SQLite storage
 
 RUN mkdir -p /app/data
 
