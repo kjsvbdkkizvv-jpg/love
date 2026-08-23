@@ -1,0 +1,15 @@
+STREAMING_CHUNK:Ignoring local environment and database files...
+
+.git
+.gitignore
+venv/
+.venv/
+pycache/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+data/
+.env
+.DS_Store
