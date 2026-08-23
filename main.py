@@ -4,6 +4,7 @@ import logging
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 import config
 from database import init_db
 
@@ -20,6 +21,22 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+async def handle_health_check(request):
+    """Health check endpoint for Fly.io proxy."""
+    return web.Response(text="LooksMatch Bot is healthy and running!", status=200)
+
+async def start_health_check_server():
+    """Starts an asynchronous HTTP server on 0.0.0.0:8080."""
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check HTTP server listening on 0.0.0.0:{port}")
 
 @bot.event
 async def on_ready():
@@ -38,12 +55,16 @@ async def main():
     logger.info("Initializing SQLite database schema...")
     await init_db()
 
+    logger.info("Starting lightweight HTTP health check server for Fly.io...")
+    await start_health_check_server()
+
     cogs = [
         "cogs.setup",
         "cogs.admin",
         "cogs.dating",
         "cogs.ratings",
-        "cogs.levels"
+        "cogs.levels",
+        "cogs.confessions"
     ]
 
     for cog in cogs:
