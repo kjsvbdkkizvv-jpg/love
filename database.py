@@ -5,7 +5,6 @@ import config
 DB_PATH = config.DB_PATH
 
 async def init_db():
-    # Ensure parent directory exists for DB path if stored in a mounted directory
     db_dir = os.path.dirname(DB_PATH)
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
@@ -79,14 +78,6 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS discovery_history (
-                user_id INTEGER,
-                target_id INTEGER,
-                shown_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, target_id)
-            )
-        """)
-        await db.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 match_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_a INTEGER,
@@ -94,6 +85,7 @@ async def init_db():
                 status TEXT DEFAULT 'ACTIVE',
                 ticket_channel_id INTEGER,
                 voice_channel_id INTEGER,
+                voice_empty_since TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 closed_at TIMESTAMP
@@ -140,20 +132,6 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS reports (
-                report_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reporter_id INTEGER,
-                target_id INTEGER,
-                match_id INTEGER,
-                category TEXT,
-                description TEXT,
-                status TEXT DEFAULT 'PENDING',
-                assigned_staff INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                resolved_at TIMESTAMP
-            )
-        """)
-        await db.execute("""
             CREATE TABLE IF NOT EXISTS xp (
                 user_id INTEGER PRIMARY KEY,
                 total_xp INTEGER DEFAULT 0,
@@ -162,6 +140,15 @@ async def init_db():
                 daily_xp INTEGER DEFAULT 0,
                 last_daily_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS confessions (
+                confession_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                user_id INTEGER,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
