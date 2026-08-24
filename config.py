@@ -151,6 +151,7 @@ WEIGHT_ALREADY_LIKED = 100
 ID_START_DATING = "ui:start_dating"
 ID_VIEW_PROFILE = "ui:view_profile"
 ID_EDIT_PROFILE = "ui:edit_profile"
+ID_CREATE_PROFILE = "ui:create_profile"
 ID_EDIT_PHOTOS = "ui:edit_photos"
 ID_PAUSE_DATING = "ui:pause_dating"
 ID_PREFERENCES = "ui:preferences"
