@@ -189,6 +189,10 @@ class PhotoConfirmView(discord.ui.View):
             logger.exception("Error during confirm photos")
             await safe_respond(interaction, content="❌ An error occurred while confirming photos. Try again.", ephemeral=True)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Unhandled error in PhotoConfirmView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
+
 
 class DiscoveryCardView(discord.ui.View):
     def __init__(self, candidate: dict, photo_index: int, cog):
@@ -288,9 +292,14 @@ class DiscoveryCardView(discord.ui.View):
             await safe_respond(interaction, content="⚠️ Failed to block candidate.", ephemeral=True)
         await self.cog.serve_next_candidate(interaction)
 
-    @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id=config.ID_VIEW_PROFILE)
+    @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id="discovery:info")
     async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.show_user_profile(interaction, self.candidate["user_id"])
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        # Surface errors instead of letting them vanish into "didn't respond in time"
+        logger.exception("Unhandled error in DiscoveryCardView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong processing that action. Please try again.", ephemeral=True)
 
 
 async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
