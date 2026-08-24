@@ -1,14 +1,90 @@
+import logging
+
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import aiosqlite
+
 import config
 from database import DB_PATH
+from cogs.setup import DiscoveryEntryView, ProfileManagementView, safe_respond, get_dating_cog
+
+logger = logging.getLogger("LooksMatch.Admin")
+
+
+class LikedYouView(discord.ui.View):
+    """Persistent view for the single button in #liked-you."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🤩 VIEW WHO LIKED YOU", style=discord.ButtonStyle.success, custom_id=config.ID_VIEW_LIKED_YOU)
+    async def view_liked_you(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        dating_cog = get_dating_cog(interaction.client)
+        if not dating_cog:
+            await safe_respond(interaction, content="⚠️ Dating system is currently unavailable.", ephemeral=True)
+            return
+        await dating_cog.serve_next_liked_you_candidate(interaction)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in LikedYouView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
+
+
+class MyRatingView(discord.ui.View):
+    """Persistent view for the single button in #my-rating."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="⭐ VIEW MY RATING", style=discord.ButtonStyle.primary, custom_id=config.ID_MY_RATING_VIEW)
+    async def view_my_rating(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT rating_count, overall_average, face_average, physique_average, style_average, tier "
+                "FROM rating_results WHERE user_id = ?",
+                (interaction.user.id,)
+            ) as c:
+                row = await c.fetchone()
+
+        if not row or not row[0]:
+            await safe_respond(
+                interaction,
+                content="⭐ You don't have any ratings yet. Head to `#get-rated` to start a rating session!",
+                ephemeral=True
+            )
+            return
+
+        rating_count, overall_avg, face_avg, physique_avg, style_avg, tier = row
+        embed = discord.Embed(title="⭐ YOUR RATING BREAKDOWN", color=config.PRIMARY_COLOR)
+        embed.add_field(name="Overall Average", value=f"{overall_avg}/10" if overall_avg is not None else "N/A", inline=True)
+        embed.add_field(name="Tier", value=tier or "Unrated", inline=True)
+        embed.add_field(name="Votes Counted", value=str(rating_count), inline=True)
+        embed.add_field(name="Face", value=f"{face_avg}/10" if face_avg is not None else "N/A", inline=True)
+        embed.add_field(name="Physique", value=f"{physique_avg}/10" if physique_avg is not None else "N/A", inline=True)
+        embed.add_field(name="Style", value=f"{style_avg}/10" if style_avg is not None else "N/A", inline=True)
+
+        await safe_respond(interaction, embed=embed, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in MyRatingView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
+
 
 class AdminCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    async def cog_load(self):
         self.update_stats_task.start()
+        # Only register the views THIS cog owns. DiscoveryEntryView and
+        # ProfileManagementView are already registered by cogs.setup's
+        # cog_load — registering them again here would raise a duplicate
+        # custom_id error and break this cog's load.
+        self.bot.add_view(LikedYouView())
+        self.bot.add_view(MyRatingView())
 
     def cog_unload(self):
         self.update_stats_task.cancel()
@@ -84,8 +160,7 @@ class AdminCog(commands.Cog):
                     description="Discover community members personalized to your age group and preferences.\nClick below to start swiping through profiles!",
                     color=config.PRIMARY_COLOR
                 )
-                view = discord.ui.View(timeout=None)
-                view.add_item(discord.ui.Button(label="💕 START DATING", style=discord.ButtonStyle.green, custom_id=config.ID_START_DATING))
+                view = DiscoveryEntryView()
                 await discover_ch.purge(limit=5)
                 await discover_ch.send(embed=embed, view=view)
                 reports.append("✅ Discovery Panel posted in `#discover` (`CHANNEL_DISCOVER`).")
@@ -101,10 +176,7 @@ class AdminCog(commands.Cog):
                     description="Manage your dating profile card, update your photos, or pause dating activity.",
                     color=config.PRIMARY_COLOR
                 )
-                view = discord.ui.View(timeout=None)
-                view.add_item(discord.ui.Button(label="👤 VIEW PROFILE", style=discord.ButtonStyle.primary, custom_id=config.ID_VIEW_PROFILE))
-                view.add_item(discord.ui.Button(label="✏️ CREATE / EDIT PROFILE", style=discord.ButtonStyle.secondary, custom_id=config.ID_EDIT_PROFILE))
-                view.add_item(discord.ui.Button(label="⏸️ PAUSE DATING", style=discord.ButtonStyle.danger, custom_id=config.ID_PAUSE_DATING))
+                view = ProfileManagementView()
                 await my_profile_ch.purge(limit=5)
                 await my_profile_ch.send(embed=embed, view=view)
                 reports.append("✅ Profile Panel posted in `#my-profile` (`CHANNEL_MY_PROFILE`).")
@@ -120,8 +192,7 @@ class AdminCog(commands.Cog):
                     description="View members who have already liked your profile!\nClick the button below to browse through them and like them back for an instant match.",
                     color=config.PRIMARY_COLOR
                 )
-                view = discord.ui.View(timeout=None)
-                view.add_item(discord.ui.Button(label="🤩 VIEW WHO LIKED YOU", style=discord.ButtonStyle.success, custom_id=config.ID_VIEW_LIKED_YOU))
+                view = LikedYouView()
                 await liked_ch.purge(limit=5)
                 await liked_ch.send(embed=embed, view=view)
                 reports.append("✅ Liked-You Panel posted in `#liked-you` (`CHANNEL_LIKED_YOU`).")
@@ -135,8 +206,7 @@ class AdminCog(commands.Cog):
                     description="View your official calculated consensus rating score, breakdown metrics, and tier assignment.",
                     color=config.PRIMARY_COLOR
                 )
-                view = discord.ui.View(timeout=None)
-                view.add_item(discord.ui.Button(label="⭐ VIEW MY RATING", style=discord.ButtonStyle.primary, custom_id=config.ID_MY_RATING_VIEW))
+                view = MyRatingView()
                 await rating_ch.purge(limit=5)
                 await rating_ch.send(embed=embed, view=view)
                 reports.append("✅ Rating Overview Panel posted in `#my-rating` (`CHANNEL_MY_RATING`).")
@@ -169,6 +239,7 @@ class AdminCog(commands.Cog):
                 await db.commit()
 
             await interaction.response.send_message(f"🔒 Audit completed: {invalidated} invalid age pair matches invalidated.", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(AdminCog(bot))
