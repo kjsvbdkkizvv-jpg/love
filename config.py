@@ -27,6 +27,7 @@ CHANNEL_SERVER_STATS = int(os.getenv("CHANNEL_SERVER_STATS", "154106547850261304
 
 # Photo ticket category (where private upload tickets are created). Falls back to CATEGORY_MATCHES if unset.
 CATEGORY_PHOTO_TICKETS = int(os.getenv("CATEGORY_PHOTO_TICKETS", "1541038079920443462"))
+CHANNEL_PHOTO_VAULT = int(os.getenv("CHANNEL_PHOTO_VAULT", "1541390233139159152"))
 
 # Roles
 ROLE_OWNER = int(os.getenv("ROLE_OWNER", "1540666072154382406"))
