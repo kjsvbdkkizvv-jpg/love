@@ -19,6 +19,30 @@ def clean_username(name: str) -> str:
     """Sanitize username for channel names."""
     return "".join(c for c in name.lower() if c.isalnum() or c in ("-", "_"))[:12] or "user"
 
+
+async def resolve_photo_urls(bot: commands.Bot, message_ids) -> List[str]:
+    """Re-fetch each vault-channel message to obtain a fresh, non-expired
+    signed attachment URL. Discord's CDN URLs are cryptographically signed
+    and expire (~24h) regardless of whether anything was deleted, so we
+    never store a raw URL long-term — only a message reference — and
+    resolve it to a live URL each time a profile is actually displayed.
+    """
+    if not message_ids:
+        return []
+    vault_channel = bot.get_channel(config.CHANNEL_PHOTO_VAULT)
+    if not vault_channel:
+        return []
+    urls = []
+    for mid in message_ids:
+        try:
+            msg = await vault_channel.fetch_message(int(mid))
+            if msg.attachments:
+                urls.append(msg.attachments[0].url)
+        except Exception:
+            # Message id invalid/legacy raw-URL entry, or message deleted from vault — skip it.
+            continue
+    return urls
+
 URL_RE = re.compile(r"https?://\S+")
 
 
@@ -155,38 +179,82 @@ class PhotoConfirmView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        channel = interaction.channel
-        urls = []
+        # The channel Confirm was pressed in — this may be the guild ticket
+        # channel OR a DM, since the same view/button is sent to both.
+        source_channel = interaction.channel
+        attachments = []
 
         try:
-            async for msg in channel.history(limit=200, oldest_first=True):
+            async for msg in source_channel.history(limit=200, oldest_first=True):
                 for att in msg.attachments:
                     if att.content_type and att.content_type.startswith("image/"):
-                        urls.append(att.url)
-                # extract simple http(s) tokens
-                for token in URL_RE.findall(msg.content or ""):
-                    urls.append(token)
-                if len(urls) >= 5:
+                        attachments.append(att)
+                if len(attachments) >= 5:
                     break
-            urls = urls[:5]
+            attachments = attachments[:5]
 
-            if not urls:
-                await safe_respond(interaction, content="No image attachments or links found in this ticket. Please upload images and press Confirm again.", ephemeral=True)
+            if not attachments:
+                await safe_respond(interaction, content="No uploaded images found in this ticket. Please upload images directly (not links) and press Confirm again.", ephemeral=True)
+                return
+
+            vault_channel = self.cog.bot.get_channel(config.CHANNEL_PHOTO_VAULT)
+            if not vault_channel:
+                logger.error("CHANNEL_PHOTO_VAULT is not configured or not accessible")
+                await safe_respond(interaction, content="⚠️ Photo storage isn't configured correctly. Please contact an admin.", ephemeral=True)
+                return
+
+            # Re-upload each image into a permanent, bot-owned vault channel.
+            # This is what actually solves photo durability: the ticket/DM
+            # can be closed freely afterward since the vault is a separate,
+            # never-deleted copy, and we re-fetch this message each time we
+            # display the profile to get a fresh (non-expired) CDN URL.
+            vault_message_ids = []
+            for att in attachments:
+                try:
+                    file = await att.to_file()
+                    vault_msg = await vault_channel.send(
+                        content=f"📸 Profile photo — <@{interaction.user.id}> (ticket #{self.ticket_id})",
+                        file=file
+                    )
+                    vault_message_ids.append(vault_msg.id)
+                except Exception:
+                    logger.exception("Failed to archive a photo to the vault channel")
+
+            if not vault_message_ids:
+                await safe_respond(interaction, content="❌ Failed to save photos permanently. Please try again.", ephemeral=True)
                 return
 
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-                                 (json.dumps(urls), urls[0], interaction.user.id))
+                await db.execute(
+                    "UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (json.dumps(vault_message_ids), str(vault_message_ids[0]), interaction.user.id)
+                )
                 await db.execute("UPDATE photo_tickets SET confirmed = 1 WHERE ticket_id = ?", (self.ticket_id,))
+                # Look up the actual guild ticket channel — independent of
+                # whichever channel (guild or DM) Confirm was pressed in.
+                async with db.execute("SELECT channel_id FROM photo_tickets WHERE ticket_id = ?", (self.ticket_id,)) as c:
+                    ticket_row = await c.fetchone()
                 await db.commit()
 
             await safe_respond(interaction, content="✅ Photos saved to your profile. Closing ticket...", ephemeral=True)
 
-            # delete channel to keep guild tidy
-            try:
-                await channel.delete(reason="Photo upload confirmed by user")
-            except Exception:
-                pass
+            # Cancel any pending expiry monitor for this ticket now that it's confirmed
+            monitor_task = self.cog._photo_ticket_monitors.pop(self.ticket_id, None)
+            if monitor_task:
+                monitor_task.cancel()
+
+            # Close/delete the real guild ticket channel (not the DM, if that's
+            # where Confirm was pressed from) to keep the guild tidy — safe now
+            # since the photos live permanently in the vault channel.
+            ticket_channel_id = ticket_row[0] if ticket_row else None
+            if ticket_channel_id:
+                self.cog._photo_ticket_confirm_msgs.pop(ticket_channel_id, None)
+                ticket_channel = self.cog.bot.get_channel(ticket_channel_id)
+                if ticket_channel:
+                    try:
+                        await ticket_channel.delete(reason="Photo upload confirmed by user")
+                    except Exception:
+                        pass
 
         except Exception:
             logger.exception("Error during confirm photos")
@@ -469,7 +537,8 @@ class DatingCog(commands.Cog):
         embed = discord.Embed(
             title="Upload your profile photos",
             description=(
-                "Upload up to 5 images in this ticket as attachments (jpg/png/webp).\n"
+                "Upload up to 5 images in this ticket **as direct attachments** (jpg/png/webp).\n"
+                "Pasted image links are not supported — please upload the files themselves.\n"
                 "When you are happy with the images, press **Confirm Photos** below.\n"
                 "If you do not confirm within 10 minutes the ticket will be removed and you'll be notified."
             ),
@@ -477,7 +546,7 @@ class DatingCog(commands.Cog):
         )
         view = PhotoConfirmView(self, ticket_id, user.id)
         try:
-            confirm_msg = await channel.send(embed=embed, view=view)
+            confirm_msg = await channel.send(content=user.mention, embed=embed, view=view)
             self._photo_ticket_confirm_msgs[channel.id] = confirm_msg.id
         except Exception:
             logger.exception("Failed to post confirm message in ticket")
@@ -633,7 +702,7 @@ class DatingCog(commands.Cog):
             "gender": chosen[2],
             "location": chosen[3],
             "bio": chosen[4],
-            "photos": json.loads(chosen[5]) if chosen[5] else [],
+            "photos": await resolve_photo_urls(self.bot, json.loads(chosen[5])) if chosen[5] else [],
             "dating_intent": chosen[6],
             "interests": json.loads(chosen[7]) if chosen[7] else [],
             "tier": chosen[8] or "Unrated",
@@ -669,7 +738,7 @@ class DatingCog(commands.Cog):
                     "gender": row[2],
                     "location": row[3],
                     "bio": row[4],
-                    "photos": json.loads(row[5]) if row[5] else [],
+                    "photos": await resolve_photo_urls(self.bot, json.loads(row[5])) if row[5] else [],
                     "dating_intent": row[6],
                     "interests": json.loads(row[7]) if row[7] else [],
                     "tier": row[8] or "Unrated",
@@ -764,6 +833,28 @@ class DatingCog(commands.Cog):
         return channel
 
     async def serve_next_candidate(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT 1 FROM profiles WHERE user_id = ? AND bio IS NOT NULL AND bio != ''",
+                (interaction.user.id,)
+            ) as c:
+                has_profile = (await c.fetchone()) is not None
+
+        if not has_profile:
+            if interaction.guild:
+                profile_link = f"https://discord.com/channels/{interaction.guild.id}/{config.CHANNEL_MY_PROFILE}"
+            else:
+                profile_link = f"<#{config.CHANNEL_MY_PROFILE}>"
+            await safe_respond(
+                interaction,
+                content=(
+                    "❌ You need to create a dating profile before you can start discovering matches!\n"
+                    f"Head to {profile_link} and click **🆕 Create Profile** to set yours up."
+                ),
+                ephemeral=True
+            )
+            return
+
         candidate = await self.get_weighted_candidate(interaction.user.id)
         if not candidate:
             await safe_respond(interaction, content="🎉 You have viewed all available candidate profiles in your pool for now!", ephemeral=True)
@@ -835,7 +926,7 @@ class DatingCog(commands.Cog):
                 await safe_respond(interaction, content="❌ This member has not created a dating profile yet.", ephemeral=True)
             return
 
-        photos = json.loads(row[4]) if row[4] else []
+        photos = await resolve_photo_urls(self.bot, json.loads(row[4]) if row[4] else [])
         tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
 
         member = interaction.guild.get_member(target_id) if interaction.guild else None
@@ -856,12 +947,12 @@ class DatingCog(commands.Cog):
 
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
-    @app_commands.command(name="profile", description="View a member's complete dating and rating profile card")
+    @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     async def view_profile_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
         await self.show_user_profile(interaction, target.id)
 
-    @app_commands.command(name="profile-check", description="Post your dating profile publicly in #profile-check for community review")
+    @app_commands.command(name="profile-check", description="Post your profile publicly in #profile-check for review. Open to everyone; usable once per 10 minutes.")
     @app_commands.checks.cooldown(1, 600.0, key=lambda i: i.user.id)
     async def profile_check_cmd(self, interaction: discord.Interaction):
         if config.CHANNEL_PROFILE_CHECK and interaction.channel_id != config.CHANNEL_PROFILE_CHECK:
@@ -886,10 +977,7 @@ class DatingCog(commands.Cog):
             await safe_respond(interaction, content="❌ You have not created a dating profile yet! Set it up in `#my-profile` first.", ephemeral=True)
             return
 
-        photos = json.loads(row[4]) if row[4] else []
-        tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
-
-        is_verified = any(r.id == config.ROLE_VERIFIED for r in interaction.user.roles)
+        photos = await resolve_photo_urls(self.bot, json.loads(row[4]) if row[4] else [])
         verified_badge = " ☑️ **Verified Member**" if is_verified else ""
 
         embed = discord.Embed(
