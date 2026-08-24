@@ -145,7 +145,7 @@ class AdminCog(commands.Cog):
         await stats_ch.purge(limit=5)
         await stats_ch.send(embed=embed)
 
-    @app_commands.command(name="post-panels", description="Post persistent interactive UI panels into your configured channel IDs")
+    @app_commands.command(name="post-panels", description="Post persistent interactive UI panels into configured channels. Administrator only.")
     @app_commands.checks.has_permissions(administrator=True)
     async def post_panels(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -217,7 +217,7 @@ class AdminCog(commands.Cog):
             color=config.PRIMARY_COLOR
         ), ephemeral=True)
 
-    @app_commands.command(name="dating-admin", description="Administrative control panel for LooksMatch")
+    @app_commands.command(name="dating-admin", description="Run administrative actions (e.g. audit matches) for LooksMatch. Administrator only.")
     @app_commands.checks.has_permissions(administrator=True)
     async def dating_admin(self, interaction: discord.Interaction, action: str, target: discord.Member = None):
         if action == "audit":
