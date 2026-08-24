@@ -18,14 +18,17 @@ def get_dating_cog(bot):
 
 async def safe_respond(interaction: discord.Interaction, /, *, content=None, embed=None, view=None, ephemeral=True, **kwargs):
     """Send using response.send_message unless response is already used, then fallback to followup.send."""
+    # discord.py's webhook/response senders require the MISSING sentinel (not
+    # literal None) when no view is supplied — passing None raises a TypeError.
+    send_view = view if view is not None else discord.utils.MISSING
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.response.send_message(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
         else:
-            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
     except Exception:
         try:
-            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
         except Exception:
             logger.exception("safe_respond failed to send followup")
 
@@ -64,8 +67,41 @@ class ProfileManagementView(discord.ui.View):
             return
         await dating_cog.show_user_profile(interaction, interaction.user.id)
 
+    @staticmethod
+    async def _has_profile(user_id: int) -> bool:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT 1 FROM profiles WHERE user_id = ? AND bio IS NOT NULL AND bio != ''",
+                (user_id,)
+            ) as c:
+                return (await c.fetchone()) is not None
+
+    @discord.ui.button(label="🆕 CREATE PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_CREATE_PROFILE)
+    async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._has_profile(interaction.user.id):
+            await safe_respond(
+                interaction,
+                content="You already have a profile! Use **✏️ Edit Profile** instead to make changes.",
+                ephemeral=True
+            )
+            return
+
+        from cogs.dating import ProfileEditModal
+
+        dating_cog = get_dating_cog(interaction.client)
+        modal = ProfileEditModal(dating_cog)
+        await interaction.response.send_modal(modal)
+
     @discord.ui.button(label="✏️ EDIT PROFILE", style=discord.ButtonStyle.secondary, custom_id=config.ID_EDIT_PROFILE)
     async def edit_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._has_profile(interaction.user.id):
+            await safe_respond(
+                interaction,
+                content="You don't have a profile yet! Use **🆕 Create Profile** to set one up first.",
+                ephemeral=True
+            )
+            return
+
         # Local import avoids a circular import at module load time
         from cogs.dating import ProfileEditModal
 
