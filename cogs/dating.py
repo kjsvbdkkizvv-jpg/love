@@ -29,14 +29,17 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
     Safe to call from command callbacks and button handlers, whether or not
     interaction.response has already been used (e.g. via defer()).
     """
+    # discord.py's webhook/response senders require the MISSING sentinel (not
+    # literal None) when no view is supplied — passing None raises a TypeError.
+    send_view = view if view is not None else discord.utils.MISSING
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.response.send_message(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
         else:
-            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
     except Exception:
         try:
-            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
         except Exception:
             logger.exception("safe_respond failed to send followup")
 
