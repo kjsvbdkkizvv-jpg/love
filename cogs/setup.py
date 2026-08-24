@@ -274,7 +274,7 @@ class SetupCog(commands.Cog):
             if my_profile_ch:
                 await my_profile_ch.send(content=member.mention, embed=embed, view=view)
 
-    @app_commands.command(name="setup", description="Initialize permanent server channels, roles, database, and persistent UIs")
+    @app_commands.command(name="setup", description="Initialize permanent channels, roles, database, and persistent UIs. Administrator only.")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_server(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
