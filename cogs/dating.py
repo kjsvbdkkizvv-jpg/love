@@ -954,7 +954,7 @@ class DatingCog(commands.Cog):
         target = member or interaction.user
         await self.show_user_profile(interaction, target.id)
 
-    @app_commands.command(name="profile-check", description="Post your profile publicly in #profile-check for review. Open to everyone; usable once per 10 minutes.")
+    @app_commands.command(name="profile-check", description="Post your profile publicly in #profile-check for review. Open to everyone (10 min cooldown).")
     @app_commands.checks.cooldown(1, 600.0, key=lambda i: i.user.id)
     async def profile_check_cmd(self, interaction: discord.Interaction):
         if config.CHANNEL_PROFILE_CHECK and interaction.channel_id != config.CHANNEL_PROFILE_CHECK:
