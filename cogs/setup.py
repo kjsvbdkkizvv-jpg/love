@@ -84,14 +84,10 @@ class ProfileManagementView(discord.ui.View):
 
     @discord.ui.button(label="🆕 CREATE PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_CREATE_PROFILE)
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_adult_member(interaction.user if isinstance(interaction.user, discord.Member) else None):
-            await safe_respond(
-                interaction,
-                content="❌ LooksMatch is an adults-only dating system. You need a verified adult age role to create a profile.",
-                ephemeral=True
-            )
-            return
-
+        # No pre-existing age-role check here: the wizard's own Age step is
+        # where a real (adult-only) role gets assigned. Requiring one to
+        # already exist would lock everyone out before the roles have ever
+        # been assigned to anyone.
         if await self._has_profile(interaction.user.id):
             await safe_respond(
                 interaction,
@@ -155,14 +151,6 @@ class OnboardingProfileView(discord.ui.View):
 
     @discord.ui.button(label="✏️ CREATE DATING PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_ONBOARDING_SETUP_PROFILE)
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_adult_member(interaction.user if isinstance(interaction.user, discord.Member) else None):
-            await safe_respond(
-                interaction,
-                content="❌ LooksMatch is an adults-only dating system. You need a verified adult age role to create a profile.",
-                ephemeral=True
-            )
-            return
-
         from cogs.dating import ProfileEditModal
 
         dating_cog = get_dating_cog(interaction.client)
@@ -246,10 +234,8 @@ class SetupCog(commands.Cog):
             await self.trigger_onboarding_profile_setup(after)
 
     async def trigger_onboarding_profile_setup(self, member: discord.Member):
-        if not is_adult_member(member):
-            # Don't offer profile creation to anyone without a verified adult age role.
-            return
-
+        # No age-role check here either — see create_profile for why. The
+        # wizard's Age step is what actually assigns a real adult role.
         embed = discord.Embed(
             title="💕 COMPLETE YOUR DATING PROFILE",
             description=(
