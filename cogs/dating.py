@@ -7,8 +7,7 @@ import random
 import json
 import datetime
 import logging
-import re
-from typing import List
+from typing import List, Optional
 
 import config
 from database import DB_PATH
@@ -16,47 +15,62 @@ from database import DB_PATH
 logger = logging.getLogger("LooksMatch.Dating")
 
 PHOTO_TICKET_TIMEOUT = 600  # 10 minutes in seconds
+MAX_MEDIA_ITEMS = 5
+MAX_INTERESTS = 5
+
+# Label translation between the "Interested In" role set and the "Gender" role
+# set, since config.py names them differently ("Men"/"Women" vs "Man"/"Woman").
+INTEREST_TO_GENDER = {"Men": "Man", "Women": "Woman"}
+
 
 def clean_username(name: str) -> str:
     """Sanitize username for channel names."""
     return "".join(c for c in name.lower() if c.isalnum() or c in ("-", "_"))[:12] or "user"
 
 
-async def resolve_photo_urls(bot: commands.Bot, message_ids) -> List[str]:
+def is_adult_member(member: Optional[discord.Member]) -> bool:
+    """True only if the member holds one of the configured adult age roles.
+    config.AGE_ROLES must never contain an underage bracket — this is the
+    single gate that keeps the whole dating system adults-only."""
+    if not member:
+        return False
+    adult_role_ids = set(config.AGE_ROLES.values())
+    return any(role.id in adult_role_ids for role in member.roles)
+
+
+async def resolve_profile_media(bot: commands.Bot, media_items) -> List[dict]:
     """Re-fetch each vault-channel message to obtain a fresh, non-expired
     signed attachment URL. Discord's CDN URLs are cryptographically signed
     and expire (~24h) regardless of whether anything was deleted, so we
     never store a raw URL long-term — only a message reference — and
     resolve it to a live URL each time a profile is actually displayed.
+    Returns a list of {"url": str, "is_video": bool}.
     """
-    if not message_ids:
+    if not media_items:
         return []
     vault_channel = bot.get_channel(config.CHANNEL_PHOTO_VAULT)
     if not vault_channel:
         return []
-    urls = []
-    for mid in message_ids:
+    resolved = []
+    for item in media_items:
         try:
-            msg = await vault_channel.fetch_message(int(mid))
+            mid = int(item["id"]) if isinstance(item, dict) else int(item)
+            is_video = isinstance(item, dict) and item.get("type") == "video"
+            msg = await vault_channel.fetch_message(mid)
             if msg.attachments:
-                urls.append(msg.attachments[0].url)
+                resolved.append({"url": msg.attachments[0].url, "is_video": is_video})
         except Exception:
-            # Message id invalid/legacy raw-URL entry, or message deleted from vault — skip it.
+            # Message id invalid/legacy entry, or message deleted from vault — skip it.
             continue
-    return urls
-
-URL_RE = re.compile(r"https?://\S+")
+    return resolved
 
 
-# --- NEW: safe response helper ---
 async def safe_respond(interaction: discord.Interaction, /, *, content=None, embed=None, view=None, ephemeral=True, **kwargs):
     """Send using response.send_message unless response is already used, then fallback to followup.send.
 
     Safe to call from command callbacks and button handlers, whether or not
     interaction.response has already been used (e.g. via defer()).
     """
-    # discord.py's webhook/response senders require the MISSING sentinel (not
-    # literal None) when no view is supplied — passing None raises a TypeError.
     send_view = view if view is not None else discord.utils.MISSING
     try:
         if not interaction.response.is_done():
@@ -70,33 +84,435 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
             logger.exception("safe_respond failed to send followup")
 
 
+async def apply_role_change(interaction: discord.Interaction, role_dict: dict, chosen_label: str, db_column: str):
+    """Shared handler for Region/Gender/Age/Interested-In selections:
+    removes any existing role from that category and assigns the new one,
+    then persists the same value to the matching users.<db_column>.
+    This is THE mechanism that keeps profile data, Discord roles, and
+    matching criteria synchronized — reused by every structured field."""
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+
+    if member:
+        old_role_ids = set(role_dict.values())
+        roles_to_remove = [r for r in member.roles if r.id in old_role_ids]
+        if roles_to_remove:
+            try:
+                await member.remove_roles(*roles_to_remove, reason=f"Updated {db_column} via profile wizard")
+            except Exception:
+                logger.exception("Failed to remove old %s role(s)", db_column)
+        new_role_id = role_dict.get(chosen_label)
+        new_role = interaction.guild.get_role(new_role_id) if new_role_id else None
+        if new_role:
+            try:
+                await member.add_roles(new_role, reason=f"Updated {db_column} via profile wizard")
+            except Exception:
+                logger.exception("Failed to add new %s role", db_column)
+
+    guild_id = interaction.guild_id or (interaction.guild.id if interaction.guild else None)
+    extra_pool_clause = ", dating_pool = 'ADULT'" if db_column == "age_group" else ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"""INSERT INTO users (user_id, guild_id, {db_column}, dating_eligible, dating_enabled)
+                VALUES (?, ?, ?, 1, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    {db_column} = excluded.{db_column}{extra_pool_clause},
+                    updated_at = CURRENT_TIMESTAMP""",
+            (interaction.user.id, guild_id, chosen_label)
+        )
+        await db.commit()
+
+
+async def get_missing_dating_requirements(user_id: int) -> List[str]:
+    """Returns human-readable names of required dating fields the user has
+    not yet completed: Age Group, Region, Gender, Interested In."""
+    missing = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT age_group, location, gender, interested_in FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as c:
+            row = await c.fetchone()
+
+    if not row:
+        return ["Age Group", "Region", "Gender", "Interested In"]
+
+    age_group, location, gender, interested_in = row
+    if not age_group:
+        missing.append("Age Group")
+    if not location:
+        missing.append("Region")
+    if not gender:
+        missing.append("Gender")
+    if not interested_in:
+        missing.append("Interested In")
+    return missing
+
+
+async def recompute_dating_eligible(user_id: int):
+    """A profile only becomes eligible for discovery once Age Group, Region,
+    Gender, Interested In, and a bio all exist. Called after every relevant
+    edit so dating_eligible (already enforced in the matching SQL) never
+    drifts out of sync with the actual profile state."""
+    missing = await get_missing_dating_requirements(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM profiles WHERE user_id = ? AND bio IS NOT NULL AND bio != ''",
+            (user_id,)
+        ) as c:
+            has_bio = (await c.fetchone()) is not None
+        complete = (not missing) and has_bio
+        await db.execute(
+            "UPDATE users SET dating_eligible = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (1 if complete else 0, user_id)
+        )
+        await db.commit()
+
+
+class ChoiceStepView(discord.ui.View):
+    """Generic single-question button step: renders one button per option
+    and calls back with whichever label was chosen. Used for every
+    structured field (Region/Gender/Age/Interested In) so the wizard and
+    the individual-field editors share one implementation."""
+
+    def __init__(self, options: List[str], on_choice, owner_id: int, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.on_choice = on_choice
+        self.owner_id = owner_id
+        for label in options:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            btn.callback = self._make_callback(label)
+            self.add_item(btn)
+
+    def _make_callback(self, label: str):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.owner_id:
+                await safe_respond(interaction, content="This isn't your profile setup session.", ephemeral=True)
+                return
+            await self.on_choice(interaction, label)
+        return callback
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in ChoiceStepView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again from Edit Profile.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Wizard step orchestration (chained via interaction.response.edit_message)
+# ---------------------------------------------------------------------------
+
+async def show_region_step(interaction: discord.Interaction, cog, next_step):
+    embed = discord.Embed(title="🌎 Select your region", description="Where are you located?", color=config.PRIMARY_COLOR)
+
+    async def on_choice(i2: discord.Interaction, label: str):
+        await apply_role_change(i2, config.REGION_ROLES, label, "location")
+        await next_step(i2, cog)
+
+    view = ChoiceStepView(list(config.REGION_ROLES.keys()), on_choice, interaction.user.id)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def show_gender_step(interaction: discord.Interaction, cog, next_step):
+    embed = discord.Embed(title="⚧ Select your gender", color=config.PRIMARY_COLOR)
+
+    async def on_choice(i2: discord.Interaction, label: str):
+        await apply_role_change(i2, config.GENDER_ROLES, label, "gender")
+        await next_step(i2, cog)
+
+    view = ChoiceStepView(list(config.GENDER_ROLES.keys()), on_choice, interaction.user.id)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def show_age_step(interaction: discord.Interaction, cog, next_step):
+    embed = discord.Embed(
+        title="🎂 Select your age group",
+        description="Only adult age groups are available.",
+        color=config.PRIMARY_COLOR
+    )
+
+    async def on_choice(i2: discord.Interaction, label: str):
+        # AGE SELECTION TOUCHES DISCORD ROLES — this is the same apply_role_change
+        # helper used for every structured field, assigning/removing the real
+        # config.AGE_ROLES role. Underage brackets cannot appear here because
+        # they are not present in config.AGE_ROLES at all.
+        await apply_role_change(i2, config.AGE_ROLES, label, "age_group")
+        await next_step(i2, cog)
+
+    view = ChoiceStepView(list(config.AGE_ROLES.keys()), on_choice, interaction.user.id)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def show_interested_in_step(interaction: discord.Interaction, cog, next_step):
+    embed = discord.Embed(title="❤️ Who are you interested in?", color=config.PRIMARY_COLOR)
+
+    async def on_choice(i2: discord.Interaction, label: str):
+        await apply_role_change(i2, config.INTERESTED_IN_ROLES, label, "interested_in")
+        await next_step(i2, cog)
+
+    view = ChoiceStepView(list(config.INTERESTED_IN_ROLES.keys()), on_choice, interaction.user.id)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def show_media_step(interaction: discord.Interaction, cog):
+    """Terminal step for the CREATE wizard: always a fresh/empty profile at
+    this point, so it's a simple Add Media / Finish choice."""
+    embed = discord.Embed(
+        title="📸 Add your profile media",
+        description=f"You can add up to {MAX_MEDIA_ITEMS} media items (photos or videos).",
+        color=config.PRIMARY_COLOR
+    )
+    view = discord.ui.View(timeout=300)
+
+    add_btn = discord.ui.Button(label="Add Media", style=discord.ButtonStyle.success)
+    finish_btn = discord.ui.Button(label="Finish", style=discord.ButtonStyle.secondary)
+
+    async def on_add(i2: discord.Interaction):
+        if i2.user.id != interaction.user.id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await i2.response.edit_message(
+            content=f"📸 Upload up to {MAX_MEDIA_ITEMS} photos/videos in your ticket, then press Confirm.",
+            embed=None, view=None
+        )
+        await start_media_ticket(i2, cog, mode="replace", max_items=MAX_MEDIA_ITEMS)
+
+    async def on_finish(i2: discord.Interaction):
+        if i2.user.id != interaction.user.id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await recompute_dating_eligible(i2.user.id)
+        missing = await get_missing_dating_requirements(i2.user.id)
+        note = "🎉 Profile complete!" if not missing else f"✅ Profile saved. Still missing: {', '.join(missing)}."
+        await i2.response.edit_message(content=note, embed=None, view=None)
+
+    add_btn.callback = on_add
+    finish_btn.callback = on_finish
+    view.add_item(add_btn)
+    view.add_item(finish_btn)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def start_media_ticket(interaction: discord.Interaction, cog, mode: str, max_items: int):
+    if not interaction.guild:
+        await safe_respond(interaction, content="Please run this from within the server so I can create your media ticket.", ephemeral=True)
+        return
+    await cog.create_photo_ticket(interaction.guild, interaction.user, mode=mode, max_items=max_items)
+
+
+async def show_media_edit_choice(interaction: discord.Interaction, cog, current_count: int):
+    embed = discord.Embed(title="What would you like to do?", color=config.PRIMARY_COLOR)
+    view = discord.ui.View(timeout=300)
+    owner_id = interaction.user.id
+
+    if current_count < MAX_MEDIA_ITEMS:
+        remaining = MAX_MEDIA_ITEMS - current_count
+        add_btn = discord.ui.Button(label="Add Media", style=discord.ButtonStyle.success)
+
+        async def on_add(i2: discord.Interaction):
+            if i2.user.id != owner_id:
+                await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+                return
+            await i2.response.edit_message(
+                content=f"You currently have {current_count}/{MAX_MEDIA_ITEMS} media items. Send up to {remaining} more in your ticket, then press Confirm.",
+                embed=None, view=None
+            )
+            await start_media_ticket(i2, cog, mode="append", max_items=remaining)
+
+        add_btn.callback = on_add
+        view.add_item(add_btn)
+
+    replace_btn = discord.ui.Button(label="Clear & Replace", style=discord.ButtonStyle.danger)
+
+    async def on_replace(i2: discord.Interaction):
+        if i2.user.id != owner_id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await i2.response.edit_message(
+            content=f"Your current media will be removed. Send your new media (up to {MAX_MEDIA_ITEMS}) in your ticket, then press Confirm.",
+            embed=None, view=None
+        )
+        await start_media_ticket(i2, cog, mode="replace", max_items=MAX_MEDIA_ITEMS)
+
+    replace_btn.callback = on_replace
+    view.add_item(replace_btn)
+
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def show_media_edit_prompt(interaction: discord.Interaction, cog):
+    """Entry point for editing media on an EXISTING profile: never forces
+    re-upload, always asks first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT photos FROM profiles WHERE user_id = ?", (interaction.user.id,)) as c:
+            row = await c.fetchone()
+    existing_media = json.loads(row[0]) if row and row[0] else []
+    count = len(existing_media)
+
+    embed = discord.Embed(title="📸 Would you like to edit your pictures?", color=config.PRIMARY_COLOR)
+    view = discord.ui.View(timeout=300)
+    owner_id = interaction.user.id
+
+    yes_btn = discord.ui.Button(label="Yes", style=discord.ButtonStyle.primary)
+    no_btn = discord.ui.Button(label="No", style=discord.ButtonStyle.secondary)
+
+    async def on_yes(i2: discord.Interaction):
+        if i2.user.id != owner_id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await show_media_edit_choice(i2, cog, count)
+
+    async def on_no(i2: discord.Interaction):
+        if i2.user.id != owner_id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await recompute_dating_eligible(i2.user.id)
+        missing = await get_missing_dating_requirements(i2.user.id)
+        note = "✅ Profile updated!" if not missing else f"✅ Profile updated. Still missing: {', '.join(missing)}."
+        await i2.response.edit_message(content=note, embed=None, view=None)
+
+    yes_btn.callback = on_yes
+    no_btn.callback = on_no
+    view.add_item(yes_btn)
+    view.add_item(no_btn)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def finalize_single_field_edit(interaction: discord.Interaction, cog):
+    """After editing one structured field (Region/Gender/Age/Interested In),
+    check what's still missing and, if this profile isn't complete yet,
+    offer a one-tap continuation into the next missing step rather than
+    forcing the whole wizard again."""
+    missing = await get_missing_dating_requirements(interaction.user.id)
+    if not missing:
+        await interaction.response.edit_message(content="✅ Profile updated!", embed=None, view=None)
+        return
+
+    step_map = {
+        "Region": lambda i, c: show_region_step(i, c, finalize_single_field_edit),
+        "Gender": lambda i, c: show_gender_step(i, c, finalize_single_field_edit),
+        "Age Group": lambda i, c: show_age_step(i, c, finalize_single_field_edit),
+        "Interested In": lambda i, c: show_interested_in_step(i, c, finalize_single_field_edit),
+    }
+    next_missing = missing[0]
+    embed = discord.Embed(
+        title="✅ Saved!",
+        description=f"You're also still missing: **{', '.join(missing)}**.\nWant to set **{next_missing}** now?",
+        color=config.PRIMARY_COLOR
+    )
+    view = discord.ui.View(timeout=300)
+    owner_id = interaction.user.id
+
+    now_btn = discord.ui.Button(label=f"Set {next_missing}", style=discord.ButtonStyle.success)
+    later_btn = discord.ui.Button(label="Later", style=discord.ButtonStyle.secondary)
+
+    async def on_now(i2: discord.Interaction):
+        if i2.user.id != owner_id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await step_map[next_missing](i2, cog)
+
+    async def on_later(i2: discord.Interaction):
+        if i2.user.id != owner_id:
+            await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        await i2.response.edit_message(
+            content=f"✅ Saved. Still missing: {', '.join(missing)}.", embed=None, view=None
+        )
+
+    now_btn.callback = on_now
+    later_btn.callback = on_later
+    view.add_item(now_btn)
+    view.add_item(later_btn)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+class EditChoiceView(discord.ui.View):
+    """'What would you like to edit?' menu — the entry point for editing an
+    existing profile. Only touches the section the user actually picks."""
+
+    def __init__(self, cog, owner_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await safe_respond(interaction, content="This isn't your profile edit session.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="📝 About Me / Intentions / Interests", style=discord.ButtonStyle.primary)
+    async def edit_text(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_bio, current_intent, current_interests = "", "", ""
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT bio, dating_intent, interests FROM profiles WHERE user_id = ?",
+                (interaction.user.id,)
+            ) as c:
+                row = await c.fetchone()
+        if row:
+            current_bio = row[0] or ""
+            current_intent = row[1] or ""
+            try:
+                current_interests = ", ".join(json.loads(row[2])) if row[2] else ""
+            except Exception:
+                current_interests = ""
+
+        modal = ProfileEditModal(
+            self.cog,
+            current_bio=current_bio,
+            current_intent=current_intent,
+            current_interests=current_interests,
+            is_new_profile=False,
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🌎 Region", style=discord.ButtonStyle.secondary)
+    async def edit_region(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_region_step(interaction, self.cog, finalize_single_field_edit)
+
+    @discord.ui.button(label="⚧ Gender", style=discord.ButtonStyle.secondary)
+    async def edit_gender(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_gender_step(interaction, self.cog, finalize_single_field_edit)
+
+    @discord.ui.button(label="🎂 Age", style=discord.ButtonStyle.secondary)
+    async def edit_age(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_age_step(interaction, self.cog, finalize_single_field_edit)
+
+    @discord.ui.button(label="❤️ Interested In", style=discord.ButtonStyle.secondary)
+    async def edit_interested_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_interested_in_step(interaction, self.cog, finalize_single_field_edit)
+
+    @discord.ui.button(label="📸 Pictures/Media", style=discord.ButtonStyle.secondary)
+    async def edit_media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_media_edit_prompt(interaction, self.cog)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in EditChoiceView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
+
+
 class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
-    def __init__(self, cog, current_bio="", current_region="North America", current_intent="", current_interests=""):
+    def __init__(self, cog, current_bio="", current_intent="", current_interests="", is_new_profile=True):
         super().__init__()
         self.cog = cog
+        self.is_new_profile = is_new_profile
+
         self.bio = discord.ui.TextInput(
-            label="Bio / Description",
+            label="About Me",
             style=discord.TextStyle.paragraph,
             default=current_bio,
             max_length=500,
             required=True
         )
-        self.region = discord.ui.TextInput(
-            label="Region / Location",
-            placeholder="North America, Europe, Asia, Oceania, South America, Africa",
-            default=current_region or "North America",
-            max_length=50,
-            required=True
-        )
         self.dating_intent = discord.ui.TextInput(
-            label="Dating Intention",
+            label="Dating Intentions",
             placeholder="Long-term relationship, casual...",
             default=current_intent,
             max_length=100,
             required=True
         )
         self.interests = discord.ui.TextInput(
-            label="Interests (Comma-separated)",
+            label=f"Interests (comma-separated, max {MAX_INTERESTS})",
             placeholder="Music, Travel, Fitness",
             default=current_interests,
             max_length=150,
@@ -104,37 +520,21 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
         )
 
         self.add_item(self.bio)
-        self.add_item(self.region)
         self.add_item(self.dating_intent)
         self.add_item(self.interests)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Defer immediately so we have time to do DB writes and channel creation
-        await interaction.response.defer(ephemeral=True)
-
-        interests_list = [i.strip() for i in self.interests.value.split(",") if i.strip()]
-        user_region_input = self.region.value.strip()
-
-        matched_region = "Other"
-        for reg_key in config.REGION_ROLES.keys():
-            if reg_key.lower() in user_region_input.lower() or user_region_input.lower() in reg_key.lower():
-                matched_region = reg_key
-                break
-
+        interests_list = [i.strip() for i in self.interests.value.split(",") if i.strip()][:MAX_INTERESTS]
         guild_id = interaction.guild_id or (interaction.guild.id if interaction.guild else None)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Ensure base user row exists and update location
                 await db.execute("""
-                    INSERT INTO users (user_id, guild_id, location, dating_eligible, dating_enabled)
-                    VALUES (?, ?, ?, 1, 1)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        location = excluded.location,
-                        updated_at = CURRENT_TIMESTAMP
-                """, (interaction.user.id, guild_id, matched_region))
+                    INSERT INTO users (user_id, guild_id, dating_eligible, dating_enabled)
+                    VALUES (?, ?, 1, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+                """, (interaction.user.id, guild_id))
 
-                # Insert or update profile WITHOUT photos yet
                 await db.execute("""
                     INSERT INTO profiles (user_id, guild_id, bio, photos, primary_photo, dating_intent, interests)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -143,24 +543,32 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
                         dating_intent = excluded.dating_intent,
                         interests = excluded.interests,
                         updated_at = CURRENT_TIMESTAMP
-                """, (interaction.user.id, guild_id, self.bio.value.strip(), json.dumps([]), None, self.dating_intent.value.strip(), json.dumps(interests_list)))
-
+                """, (interaction.user.id, guild_id, self.bio.value.strip(), json.dumps([]), None,
+                      self.dating_intent.value.strip(), json.dumps(interests_list)))
                 await db.commit()
 
-            # Acknowledge (defer already used, so this goes via followup)
-            await safe_respond(interaction, content="✅ Profile details saved. Creating a private photo upload ticket...", ephemeral=True)
+            if self.is_new_profile:
+                # Full linear wizard for a brand-new profile
+                embed = discord.Embed(title="🌎 Select your region", description="Where are you located?", color=config.PRIMARY_COLOR)
 
-            # Create ticket (in guild if available)
-            guild = interaction.guild
-            if guild:
-                await self.cog.create_photo_ticket(guild, interaction.user)
+                async def on_region_choice(i2: discord.Interaction, label: str):
+                    await apply_role_change(i2, config.REGION_ROLES, label, "location")
+                    await show_gender_step(i2, self.cog, lambda i3, c: show_age_step(i3, c, lambda i4, c2: show_interested_in_step(i4, c2, show_media_step)))
+
+                view = ChoiceStepView(list(config.REGION_ROLES.keys()), on_region_choice, interaction.user.id)
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
             else:
-                # If no guild context, DM user with instructions
-                try:
-                    dm = await interaction.user.create_dm()
-                    await dm.send("Your profile was saved, but I couldn't create a ticket because this interaction wasn't in a guild. Please re-run the profile editor from a server channel.")
-                except Exception:
-                    pass
+                # Editing text fields only — save, then check if anything else is missing
+                await recompute_dating_eligible(interaction.user.id)
+                missing = await get_missing_dating_requirements(interaction.user.id)
+                if not missing:
+                    await safe_respond(interaction, content="✅ Profile updated!", ephemeral=True)
+                else:
+                    await safe_respond(
+                        interaction,
+                        content=f"✅ Profile updated. Still missing: {', '.join(missing)}. Use Edit Profile to set these.",
+                        ephemeral=True
+                    )
 
         except Exception:
             logger.exception("Error saving profile from modal")
@@ -168,99 +576,149 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
 
 
 class PhotoConfirmView(discord.ui.View):
-    def __init__(self, cog, ticket_id: int, ticket_owner_id: int):
+    def __init__(self, cog, ticket_id: int, ticket_owner_id: int, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
         super().__init__(timeout=None)
         self.cog = cog
         self.ticket_id = ticket_id
         self.ticket_owner_id = ticket_owner_id
+        self.mode = mode
+        self.max_items = max_items
 
-    @discord.ui.button(label="✅ Confirm Photos", style=discord.ButtonStyle.green, custom_id="photo_ticket:confirm")
+    @discord.ui.button(label="✅ Confirm Media", style=discord.ButtonStyle.green, custom_id="photo_ticket:confirm")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ticket_owner_id:
-            await safe_respond(interaction, content="Only the ticket owner can confirm photos.", ephemeral=True)
+            await safe_respond(interaction, content="Only the ticket owner can confirm media.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
-        # The channel Confirm was pressed in — this may be the guild ticket
-        # channel OR a DM, since the same view/button is sent to both.
-        source_channel = interaction.channel
-        attachments = []
+        # Layer 1 — immediate in-memory guard. No await happens between the
+        # check and the add, so two near-simultaneous clicks in this process
+        # cannot both pass this check.
+        if self.ticket_id in self.cog._confirming_tickets:
+            await safe_respond(interaction, content="⏳ Your media is already being processed — please wait.", ephemeral=True)
+            return
+        self.cog._confirming_tickets.add(self.ticket_id)
 
         try:
-            async for msg in source_channel.history(limit=200, oldest_first=True):
-                for att in msg.attachments:
-                    if att.content_type and att.content_type.startswith("image/"):
-                        attachments.append(att)
-                if len(attachments) >= 5:
-                    break
-            attachments = attachments[:5]
+            # Layer 2 — disable the button immediately so re-clicking can't
+            # even generate a fresh interaction against it.
+            button.disabled = True
+            button.label = "Processing..."
+            try:
+                await interaction.response.edit_message(view=self)
+            except Exception:
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True)
 
-            if not attachments:
-                await safe_respond(interaction, content="No uploaded images found in this ticket. Please upload images directly (not links) and press Confirm again.", ephemeral=True)
-                return
-
-            vault_channel = self.cog.bot.get_channel(config.CHANNEL_PHOTO_VAULT)
-            if not vault_channel:
-                logger.error("CHANNEL_PHOTO_VAULT is not configured or not accessible")
-                await safe_respond(interaction, content="⚠️ Photo storage isn't configured correctly. Please contact an admin.", ephemeral=True)
-                return
-
-            # Re-upload each image into a permanent, bot-owned vault channel.
-            # This is what actually solves photo durability: the ticket/DM
-            # can be closed freely afterward since the vault is a separate,
-            # never-deleted copy, and we re-fetch this message each time we
-            # display the profile to get a fresh (non-expired) CDN URL.
-            vault_message_ids = []
-            for att in attachments:
-                try:
-                    file = await att.to_file()
-                    vault_msg = await vault_channel.send(
-                        content=f"📸 Profile photo — <@{interaction.user.id}> (ticket #{self.ticket_id})",
-                        file=file
-                    )
-                    vault_message_ids.append(vault_msg.id)
-                except Exception:
-                    logger.exception("Failed to archive a photo to the vault channel")
-
-            if not vault_message_ids:
-                await safe_respond(interaction, content="❌ Failed to save photos permanently. Please try again.", ephemeral=True)
-                return
-
+            # Layer 3 — atomic DB guard. Only the request that actually flips
+            # confirmed 0->1 proceeds; this is the real idempotency guarantee,
+            # independent of the button state or in-memory set.
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-                    (json.dumps(vault_message_ids), str(vault_message_ids[0]), interaction.user.id)
+                cursor = await db.execute(
+                    "UPDATE photo_tickets SET confirmed = 1 WHERE ticket_id = ? AND confirmed = 0",
+                    (self.ticket_id,)
                 )
-                await db.execute("UPDATE photo_tickets SET confirmed = 1 WHERE ticket_id = ?", (self.ticket_id,))
-                # Look up the actual guild ticket channel — independent of
-                # whichever channel (guild or DM) Confirm was pressed in.
-                async with db.execute("SELECT channel_id FROM photo_tickets WHERE ticket_id = ?", (self.ticket_id,)) as c:
-                    ticket_row = await c.fetchone()
                 await db.commit()
+                won_guard = cursor.rowcount > 0
 
-            await safe_respond(interaction, content="✅ Photos saved to your profile. Closing ticket...", ephemeral=True)
+            if not won_guard:
+                await safe_respond(interaction, content="✅ This ticket has already been confirmed.", ephemeral=True)
+                return
 
-            # Cancel any pending expiry monitor for this ticket now that it's confirmed
-            monitor_task = self.cog._photo_ticket_monitors.pop(self.ticket_id, None)
-            if monitor_task:
-                monitor_task.cancel()
+            source_channel = interaction.channel
+            found = []
+            try:
+                async for msg in source_channel.history(limit=200, oldest_first=True):
+                    for att in msg.attachments:
+                        if att.content_type and (att.content_type.startswith("image/") or att.content_type.startswith("video/")):
+                            found.append(att)
+                    if len(found) >= self.max_items:
+                        break
+                found = found[:self.max_items]
 
-            # Close/delete the real guild ticket channel (not the DM, if that's
-            # where Confirm was pressed from) to keep the guild tidy — safe now
-            # since the photos live permanently in the vault channel.
-            ticket_channel_id = ticket_row[0] if ticket_row else None
-            if ticket_channel_id:
-                self.cog._photo_ticket_confirm_msgs.pop(ticket_channel_id, None)
-                ticket_channel = self.cog.bot.get_channel(ticket_channel_id)
-                if ticket_channel:
+                if not found:
+                    # Nothing was actually processed — release the guard so they can retry.
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("UPDATE photo_tickets SET confirmed = 0 WHERE ticket_id = ?", (self.ticket_id,))
+                        await db.commit()
+                    button.disabled = False
+                    button.label = "✅ Confirm Media"
                     try:
-                        await ticket_channel.delete(reason="Photo upload confirmed by user")
+                        await interaction.message.edit(view=self)
                     except Exception:
                         pass
+                    await safe_respond(interaction, content="No uploaded photos or videos found. Please upload media directly (not links) and press Confirm again.", ephemeral=True)
+                    return
 
-        except Exception:
-            logger.exception("Error during confirm photos")
-            await safe_respond(interaction, content="❌ An error occurred while confirming photos. Try again.", ephemeral=True)
+                vault_channel = self.cog.bot.get_channel(config.CHANNEL_PHOTO_VAULT)
+                if not vault_channel:
+                    logger.error("CHANNEL_PHOTO_VAULT is not configured or accessible")
+                    await safe_respond(interaction, content="⚠️ Media storage isn't configured correctly. Please contact an admin.", ephemeral=True)
+                    return
+
+                new_media = []
+                for att in found:
+                    try:
+                        file = await att.to_file()
+                        is_video = bool(att.content_type and att.content_type.startswith("video/"))
+                        vault_msg = await vault_channel.send(
+                            content=f"{'🎥' if is_video else '📸'} Profile media — <@{interaction.user.id}> (ticket #{self.ticket_id})",
+                            file=file
+                        )
+                        new_media.append({"id": vault_msg.id, "type": "video" if is_video else "photo"})
+                    except Exception:
+                        logger.exception("Failed to archive a media item to the vault channel")
+
+                if not new_media:
+                    await safe_respond(interaction, content="❌ Failed to save media permanently. Please try again.", ephemeral=True)
+                    return
+
+                async with aiosqlite.connect(DB_PATH) as db:
+                    existing_media = []
+                    if self.mode == "append":
+                        async with db.execute("SELECT photos FROM profiles WHERE user_id = ?", (interaction.user.id,)) as c:
+                            prow = await c.fetchone()
+                        if prow and prow[0]:
+                            try:
+                                existing_media = json.loads(prow[0])
+                            except Exception:
+                                existing_media = []
+
+                    final_media = (existing_media + new_media)[:MAX_MEDIA_ITEMS]
+                    primary = str(final_media[0]["id"]) if final_media else None
+
+                    await db.execute(
+                        "UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                        (json.dumps(final_media), primary, interaction.user.id)
+                    )
+                    async with db.execute("SELECT channel_id FROM photo_tickets WHERE ticket_id = ?", (self.ticket_id,)) as c:
+                        ticket_row = await c.fetchone()
+                    await db.commit()
+
+                await recompute_dating_eligible(interaction.user.id)
+                missing = await get_missing_dating_requirements(interaction.user.id)
+                note = "✅ Media saved to your profile! 🎉 Profile complete." if not missing else \
+                    f"✅ Media saved to your profile. Still missing: {', '.join(missing)} — revisit Edit Profile to finish."
+                await safe_respond(interaction, content=f"{note} Closing ticket...", ephemeral=True)
+
+                monitor_task = self.cog._photo_ticket_monitors.pop(self.ticket_id, None)
+                if monitor_task:
+                    monitor_task.cancel()
+
+                ticket_channel_id = ticket_row[0] if ticket_row else None
+                if ticket_channel_id:
+                    self.cog._photo_ticket_confirm_msgs.pop(ticket_channel_id, None)
+                    ticket_channel = self.cog.bot.get_channel(ticket_channel_id)
+                    if ticket_channel:
+                        try:
+                            await ticket_channel.delete(reason="Media upload confirmed by user")
+                        except Exception:
+                            pass
+
+            except Exception:
+                logger.exception("Error during confirm media")
+                await safe_respond(interaction, content="❌ An error occurred while confirming media. Try again.", ephemeral=True)
+        finally:
+            self.cog._confirming_tickets.discard(self.ticket_id)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Unhandled error in PhotoConfirmView item %r", item)
@@ -268,15 +726,14 @@ class PhotoConfirmView(discord.ui.View):
 
 
 class DiscoveryCardView(discord.ui.View):
-    def __init__(self, candidate: dict, photo_index: int, cog):
-        # candidate: dict containing photos list
+    def __init__(self, candidate: dict, media_index: int, cog):
         super().__init__(timeout=300)
         self.candidate = candidate
-        self.photo_index = photo_index
+        self.media_index = media_index
         self.cog = cog
 
     async def update_message(self, interaction: discord.Interaction = None, message: discord.Message = None):
-        embed = self.cog.build_discovery_embed(self.candidate, self.photo_index, guild=interaction.guild if interaction else None)
+        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild if interaction else None)
         try:
             if interaction and interaction.response.is_done():
                 await interaction.followup.edit_message(message.id, embed=embed, view=self)
@@ -285,30 +742,25 @@ class DiscoveryCardView(discord.ui.View):
             elif interaction:
                 await interaction.response.edit_message(embed=embed, view=self)
         except Exception:
-            # fallback: ignore
             pass
 
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
     async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        photos = self.candidate.get("photos", [])
-        if photos:
-            self.photo_index = (self.photo_index - 1) % len(photos)
+        media = self.candidate.get("media", [])
+        if media:
+            self.media_index = (self.media_index - 1) % len(media)
             await self.update_message(interaction, message=interaction.message)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        photos = self.candidate.get("photos", [])
-        if photos:
-            self.photo_index = (self.photo_index + 1) % len(photos)
+        media = self.candidate.get("media", [])
+        if media:
+            self.media_index = (self.media_index + 1) % len(media)
             await self.update_message(interaction, message=interaction.message)
-
-    # Numeric jump buttons (1-5). Created dynamically at message send time in DatingCog.serve_next_candidate
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Defer immediately — DB writes + potential match-ticket channel creation can be slow
         await interaction.response.defer(ephemeral=True)
-
         liker_id = interaction.user.id
         target_id = self.candidate["user_id"]
 
@@ -338,7 +790,6 @@ class DiscoveryCardView(discord.ui.View):
         else:
             await safe_respond(interaction, content="❤️ Recorded like!", ephemeral=True)
 
-        # serve next candidate
         await self.cog.serve_next_candidate(interaction)
 
     @discord.ui.button(label="❌ PASS", style=discord.ButtonStyle.secondary, custom_id=config.ID_DISCOVERY_PASS)
@@ -370,7 +821,6 @@ class DiscoveryCardView(discord.ui.View):
         await self.cog.show_user_profile(interaction, self.candidate["user_id"])
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        # Surface errors instead of letting them vanish into "didn't respond in time"
         logger.exception("Unhandled error in DiscoveryCardView item %r", item)
         await safe_respond(interaction, content="⚠️ Something went wrong processing that action. Please try again.", ephemeral=True)
 
@@ -384,7 +834,6 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
 
         if not a_row or not b_row:
             return False
-
         if not (a_row[0] and a_row[1] and b_row[0] and b_row[1]):
             return False
 
@@ -403,11 +852,22 @@ class DatingCog(commands.Cog):
         self.bot = bot
         self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
         self._photo_ticket_monitors = {}  # ticket_id -> task
+        self._confirming_tickets = set()  # in-memory spam-click guard
 
     async def cog_load(self):
-        # Runs in an async context once the cog is added — safe place to start
-        # the background task loop and schedule the ticket-recovery coroutine.
         self.voice_cleanup_task.start()
+        # Idempotent schema migration for existing deployments: add mode/max_items
+        # to photo_tickets if they aren't already there.
+        async with aiosqlite.connect(DB_PATH) as db:
+            for stmt in (
+                "ALTER TABLE photo_tickets ADD COLUMN mode TEXT DEFAULT 'replace'",
+                "ALTER TABLE photo_tickets ADD COLUMN max_items INTEGER DEFAULT 5",
+            ):
+                try:
+                    await db.execute(stmt)
+                    await db.commit()
+                except Exception:
+                    pass  # column already exists
         asyncio.create_task(self._recover_photo_tickets())
 
     def cog_unload(self):
@@ -440,10 +900,8 @@ class DatingCog(commands.Cog):
                                 await channel.delete()
                             except discord.HTTPException:
                                 pass
-
                             await db.execute("UPDATE matches SET voice_channel_id = NULL, voice_empty_since = NULL WHERE match_id = ?", (match_id,))
                             await db.commit()
-
                             ticket_ch = self.bot.get_channel(ticket_id)
                             if ticket_ch:
                                 try:
@@ -456,17 +914,15 @@ class DatingCog(commands.Cog):
                         await db.commit()
 
     async def _recover_photo_tickets(self):
-        # Called at startup to reschedule monitors for outstanding tickets and ensure confirm messages exist
-        await asyncio.sleep(2)  # let bot be ready
+        await asyncio.sleep(2)
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT ticket_id, user_id, channel_id, created_at FROM photo_tickets WHERE confirmed = 0") as cursor:
+            async with db.execute("SELECT ticket_id, user_id, channel_id, created_at, mode, max_items FROM photo_tickets WHERE confirmed = 0") as cursor:
                 rows = await cursor.fetchall()
 
         now = datetime.datetime.utcnow()
-        for ticket_id, user_id, channel_id, created_at in rows:
+        for ticket_id, user_id, channel_id, created_at, mode, max_items in rows:
             try:
-                # parse created_at (sqlite format)
-                created_dt = None
+                created_dt = now
                 if isinstance(created_at, str):
                     try:
                         created_dt = datetime.datetime.fromisoformat(created_at)
@@ -475,42 +931,36 @@ class DatingCog(commands.Cog):
                             created_dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
                         except Exception:
                             created_dt = now
-                else:
-                    created_dt = now
 
                 elapsed = (now - created_dt).total_seconds()
                 remaining = PHOTO_TICKET_TIMEOUT - int(elapsed)
                 if remaining <= 0:
-                    # expired — attempt cleanup
                     ch = self.bot.get_channel(channel_id)
                     if ch:
-                        try: await ch.delete(reason="Photo ticket expired during downtime")
+                        try: await ch.delete(reason="Media ticket expired during downtime")
                         except Exception: pass
                     try:
                         user = await self.bot.fetch_user(user_id)
-                        await user.send("❌ Your photo upload ticket expired while the bot was offline. Please re-open the profile editor to try again.")
+                        await user.send("❌ Your media upload ticket expired while the bot was offline. Please re-open profile editing to try again.")
                     except Exception:
                         pass
                     continue
 
-                # ensure confirm message exists and register monitor
                 channel = self.bot.get_channel(channel_id)
                 if channel:
-                    # post a confirm message so the button exists and register in-memory
-                    view = PhotoConfirmView(self, ticket_id, user_id)
+                    view = PhotoConfirmView(self, ticket_id, user_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS)
                     try:
-                        msg = await channel.send("When you are ready, press Confirm Photos below.", view=view)
+                        msg = await channel.send("When you are ready, press Confirm Media below.", view=view)
                         self._photo_ticket_confirm_msgs[channel.id] = msg.id
                     except Exception:
                         pass
 
-                # schedule monitor
                 task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel_id, user_id, remaining))
                 self._photo_ticket_monitors[ticket_id] = task
             except Exception:
                 logger.exception("Error recovering ticket %s", ticket_id)
 
-    async def create_photo_ticket(self, guild: discord.Guild, user: discord.User):
+    async def create_photo_ticket(self, guild: discord.Guild, user: discord.User, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
         category = guild.get_channel(config.CATEGORY_PHOTO_TICKETS) if config.CATEGORY_PHOTO_TICKETS else guild.get_channel(config.CATEGORY_MATCHES)
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -520,7 +970,7 @@ class DatingCog(commands.Cog):
         if member:
             overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-        name = f"photo-ticket-{clean_username(user.name)}-{user.discriminator}"
+        name = f"media-ticket-{clean_username(user.name)}"
         try:
             channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
         except Exception:
@@ -532,36 +982,36 @@ class DatingCog(commands.Cog):
             return None
 
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("INSERT INTO photo_tickets (user_id, channel_id) VALUES (?, ?)", (user.id, channel.id))
+            cursor = await db.execute(
+                "INSERT INTO photo_tickets (user_id, channel_id, mode, max_items) VALUES (?, ?, ?, ?)",
+                (user.id, channel.id, mode, max_items)
+            )
             ticket_id = cursor.lastrowid
             await db.commit()
 
         embed = discord.Embed(
-            title="Upload your profile photos",
+            title="Upload your profile media",
             description=(
-                "Upload up to 5 images in this ticket **as direct attachments** (jpg/png/webp).\n"
-                "Pasted image links are not supported — please upload the files themselves.\n"
-                "When you are happy with the images, press **Confirm Photos** below.\n"
+                f"Upload up to {max_items} item(s) in this ticket **as direct attachments** (photos or videos).\n"
+                "Pasted links are not supported — please upload the files themselves.\n"
+                "When you are happy with your media, press **Confirm Media** below.\n"
                 "If you do not confirm within 10 minutes the ticket will be removed and you'll be notified."
             ),
             color=config.PRIMARY_COLOR
         )
-        view = PhotoConfirmView(self, ticket_id, user.id)
+        view = PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items)
         try:
             confirm_msg = await channel.send(content=user.mention, embed=embed, view=view)
             self._photo_ticket_confirm_msgs[channel.id] = confirm_msg.id
         except Exception:
             logger.exception("Failed to post confirm message in ticket")
 
-        # DM the user with a link and a confirm button
         try:
             dm = await user.create_dm()
-            await dm.send(f"I created your photo upload ticket: {channel.mention}. Upload images there and press Confirm when ready.", view=PhotoConfirmView(self, ticket_id, user.id))
+            await dm.send(f"I created your media upload ticket: {channel.mention}. Upload media there and press Confirm when ready.", view=PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items))
         except Exception:
-            # ignore DM failures
             pass
 
-        # spawn monitor
         task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel.id, user.id, PHOTO_TICKET_TIMEOUT))
         self._photo_ticket_monitors[ticket_id] = task
         return channel
@@ -578,18 +1028,17 @@ class DatingCog(commands.Cog):
             channel = self.bot.get_channel(channel_id)
             if channel:
                 try:
-                    await channel.delete(reason="Photo ticket expired (no confirmation)")
+                    await channel.delete(reason="Media ticket expired (no confirmation)")
                 except Exception:
                     pass
 
             try:
                 user = await self.bot.fetch_user(user_id)
                 dm = await user.create_dm()
-                await dm.send("❌ Your photo upload ticket timed out (no confirmation within 10 minutes). You can re-open the profile editor to try again.")
+                await dm.send("❌ Your media upload ticket timed out (no confirmation within 10 minutes). You can re-open profile editing to try again.")
             except Exception:
                 pass
 
-            # cleanup in-memory
             self._photo_ticket_confirm_msgs.pop(channel_id, None)
             self._photo_ticket_monitors.pop(ticket_id, None)
         except asyncio.CancelledError:
@@ -599,7 +1048,6 @@ class DatingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # keep confirm message at bottom for photo tickets
         if message.author.bot:
             return
         ch = message.channel
@@ -615,22 +1063,21 @@ class DatingCog(commands.Cog):
             except Exception:
                 pass
 
-            # find ticket id and owner
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT ticket_id, user_id FROM photo_tickets WHERE channel_id = ?", (ch.id,)) as c:
+                async with db.execute("SELECT ticket_id, user_id, mode, max_items FROM photo_tickets WHERE channel_id = ?", (ch.id,)) as c:
                     row = await c.fetchone()
             if not row:
                 return
-            ticket_id, owner_id = row
-            new_msg = await ch.send("When you are ready, press Confirm Photos below.", view=PhotoConfirmView(self, ticket_id, owner_id))
+            ticket_id, owner_id, mode, max_items = row
+            new_msg = await ch.send("When you are ready, press Confirm Media below.", view=PhotoConfirmView(self, ticket_id, owner_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS))
             self._photo_ticket_confirm_msgs[ch.id] = new_msg.id
 
     async def get_weighted_candidate(self, user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
-                SELECT u.dating_pool, u.gender, u.age_group, u.location, r.tier 
-                FROM users u 
-                LEFT JOIN rating_results r ON u.user_id = r.user_id 
+                SELECT u.dating_pool, u.gender, u.age_group, u.location, r.tier, u.interested_in
+                FROM users u
+                LEFT JOIN rating_results r ON u.user_id = r.user_id
                 WHERE u.user_id = ?
             """, (user_id,)) as c:
                 user_row = await c.fetchone()
@@ -639,7 +1086,9 @@ class DatingCog(commands.Cog):
                 return None
 
             user_pool = user_row[0]
+            user_gender = user_row[1]
             user_tier = user_row[4]
+            user_interested_in = user_row[5]
             user_tier_idx = None
             if user_tier in config.FEMALE_TIER_ORDER:
                 user_tier_idx = config.FEMALE_TIER_ORDER.index(user_tier)
@@ -649,7 +1098,8 @@ class DatingCog(commands.Cog):
             query = """
                 SELECT u.user_id, u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests,
                        r.tier, r.overall_average,
-                       EXISTS(SELECT 1 FROM likes WHERE liker_id = u.user_id AND target_id = ?) as has_liked_user
+                       EXISTS(SELECT 1 FROM likes WHERE liker_id = u.user_id AND target_id = ?) as has_liked_user,
+                       u.interested_in
                 FROM users u
                 INNER JOIN profiles p ON u.user_id = p.user_id
                 LEFT JOIN rating_results r ON u.user_id = r.user_id
@@ -660,7 +1110,7 @@ class DatingCog(commands.Cog):
                   AND u.user_id NOT IN (SELECT target_id FROM passes WHERE user_id = ?)
                   AND u.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE user_id = ?)
                   AND u.user_id NOT IN (
-                      SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END 
+                      SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END
                       FROM matches WHERE status = 'ACTIVE'
                   )
             """
@@ -673,9 +1123,22 @@ class DatingCog(commands.Cog):
         valid_candidates = []
         for cand in candidates:
             cand_id = cand[0]
+            cand_gender = cand[2]
+            cand_interested_in = cand[11]
+
+            # Reciprocal Gender <-> Interested-In matching. "Everyone" is a
+            # wildcard on either side; otherwise both directions must agree.
+            if user_interested_in and user_interested_in != "Everyone":
+                wanted_gender = INTEREST_TO_GENDER.get(user_interested_in)
+                if wanted_gender and cand_gender != wanted_gender:
+                    continue
+            if cand_interested_in and cand_interested_in != "Everyone":
+                cand_wanted_gender = INTEREST_TO_GENDER.get(cand_interested_in)
+                if cand_wanted_gender and cand_wanted_gender != user_gender:
+                    continue
+
             if await validate_dating_contact(user_id, cand_id):
                 weight = 10
-
                 cand_tier = cand[8]
                 cand_tier_idx = None
                 if cand_tier in config.FEMALE_TIER_ORDER:
@@ -704,19 +1167,20 @@ class DatingCog(commands.Cog):
             "gender": chosen[2],
             "location": chosen[3],
             "bio": chosen[4],
-            "photos": await resolve_photo_urls(self.bot, json.loads(chosen[5])) if chosen[5] else [],
+            "media": await resolve_profile_media(self.bot, json.loads(chosen[5])) if chosen[5] else [],
             "dating_intent": chosen[6],
             "interests": json.loads(chosen[7]) if chosen[7] else [],
             "tier": chosen[8] or "Unrated",
             "average_score": chosen[9],
-            "has_liked_user": bool(chosen[10])
+            "has_liked_user": bool(chosen[10]),
+            "interested_in": chosen[11],
         }
 
     async def get_next_liked_you_candidate(self, user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             query = """
                 SELECT u.user_id, u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests,
-                       r.tier, r.overall_average
+                       r.tier, r.overall_average, u.interested_in
                 FROM likes l
                 INNER JOIN users u ON l.liker_id = u.user_id
                 INNER JOIN profiles p ON u.user_id = p.user_id
@@ -740,18 +1204,19 @@ class DatingCog(commands.Cog):
                     "gender": row[2],
                     "location": row[3],
                     "bio": row[4],
-                    "photos": await resolve_photo_urls(self.bot, json.loads(row[5])) if row[5] else [],
+                    "media": await resolve_profile_media(self.bot, json.loads(row[5])) if row[5] else [],
                     "dating_intent": row[6],
                     "interests": json.loads(row[7]) if row[7] else [],
                     "tier": row[8] or "Unrated",
-                    "average_score": row[9]
+                    "average_score": row[9],
+                    "interested_in": row[10],
                 }
 
         return None
 
-    def build_discovery_embed(self, candidate: dict, photo_index: int = 0, guild: discord.Guild = None) -> discord.Embed:
-        photos = candidate.get("photos", [])
-        photo_url = photos[photo_index] if photos else None
+    def build_discovery_embed(self, candidate: dict, media_index: int = 0, guild: discord.Guild = None) -> discord.Embed:
+        media = candidate.get("media", [])
+        current = media[media_index] if media else None
 
         is_verified = False
         if guild:
@@ -765,19 +1230,23 @@ class DatingCog(commands.Cog):
 
         embed = discord.Embed(
             title=f"👤 Member Profile — {candidate.get('age_group')}{verified_badge}",
-            description=f"**Bio:** {candidate.get('bio')}",
+            description=f"**About Me:** {candidate.get('bio')}",
             color=config.PRIMARY_COLOR
         )
+        embed.add_field(name="⚧ Gender", value=candidate.get('gender') or "Unspecified", inline=True)
+        embed.add_field(name="❤️ Interested In", value=candidate.get('interested_in') or "Unspecified", inline=True)
         embed.add_field(name="📍 Location", value=candidate.get('location') or "Unknown", inline=True)
         embed.add_field(name="🎯 Intent", value=candidate.get('dating_intent') or "Not specified", inline=True)
         embed.add_field(name="📊 Rating Tier", value=f"**{tier_str}**", inline=True)
         embed.add_field(name="🎵 Interests", value=interests_str, inline=False)
 
-        if photo_url:
-            embed.set_image(url=photo_url)
+        if current and not current["is_video"]:
+            embed.set_image(url=current["url"])
+        elif current and current["is_video"]:
+            embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
 
-        if photos:
-            embed.set_footer(text=f"Photo {photo_index + 1} of {len(photos)}")
+        if media:
+            embed.set_footer(text=f"Media {media_index + 1} of {len(media)}")
 
         return embed
 
@@ -804,7 +1273,6 @@ class DatingCog(commands.Cog):
 
         user_a = guild.get_member(user_a_id)
         user_b = guild.get_member(user_b_id)
-
         name_a = clean_username(user_a.name if user_a else "user1")
         name_b = clean_username(user_b.name if user_b else "user2")
         ticket_name = f"💌・{name_a}-{name_b}"
@@ -827,31 +1295,33 @@ class DatingCog(commands.Cog):
             description=f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\nYou both liked each other. This is your private match ticket to chat and create a voice room.",
             color=config.PRIMARY_COLOR
         )
-        view = None
         try:
-            await channel.send(embed=welcome_embed, view=view)
+            await channel.send(embed=welcome_embed)
         except Exception:
             pass
         return channel
 
     async def serve_next_candidate(self, interaction: discord.Interaction):
+        missing = await get_missing_dating_requirements(interaction.user.id)
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT 1 FROM profiles WHERE user_id = ? AND bio IS NOT NULL AND bio != ''",
                 (interaction.user.id,)
             ) as c:
-                has_profile = (await c.fetchone()) is not None
+                has_bio = (await c.fetchone()) is not None
 
-        if not has_profile:
+        if not has_bio or missing:
             if interaction.guild:
                 profile_link = f"https://discord.com/channels/{interaction.guild.id}/{config.CHANNEL_MY_PROFILE}"
             else:
                 profile_link = f"<#{config.CHANNEL_MY_PROFILE}>"
+            still_needed = (["a profile with About Me"] if not has_bio else []) + missing
             await safe_respond(
                 interaction,
                 content=(
-                    "❌ You need to create a dating profile before you can start discovering matches!\n"
-                    f"Head to {profile_link} and click **🆕 Create Profile** to set yours up."
+                    "❌ You need to complete your dating profile before you can start discovering matches!\n"
+                    f"Still needed: {', '.join(still_needed)}.\n"
+                    f"Head to {profile_link} to finish setting up."
                 ),
                 ephemeral=True
             )
@@ -862,32 +1332,26 @@ class DatingCog(commands.Cog):
             await safe_respond(interaction, content="🎉 You have viewed all available candidate profiles in your pool for now!", ephemeral=True)
             return
 
-        # send polished discovery card as ephemeral message
         embed = self.build_discovery_embed(candidate, guild=interaction.guild)
         view = DiscoveryCardView(candidate, 0, self)
 
-        # add numeric jump buttons dynamically to the view based on number of photos
-        photos = candidate.get('photos', [])
-        max_photos = min(5, len(photos))
-        for i in range(max_photos):
+        media = candidate.get('media', [])
+        max_media = min(5, len(media))
+        for i in range(max_media):
             idx = i
 
-            async def jump_callback(interaction: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
-                viewref.photo_index = index
-                await viewref.update_message(interaction, message=interaction.message)
+            async def jump_callback(interaction2: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
+                viewref.media_index = index
+                await viewref.update_message(interaction2, message=interaction2.message)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
             view.add_item(btn)
 
-        # add page indicator as disabled button
         def make_indicator(idx, total):
-            dots = []
-            for n in range(total):
-                dots.append('●' if n == idx else '○')
-            return ' '.join(dots)
+            return ' '.join('●' if n == idx else '○' for n in range(total))
 
-        indicator_label = make_indicator(0, max(1, len(photos)))
+        indicator_label = make_indicator(0, max(1, len(media)))
         indicator_btn = discord.ui.Button(label=indicator_label, style=discord.ButtonStyle.gray, disabled=True, custom_id=f"discovery:indicator:{interaction.user.id}:{random.randint(1,100000)}")
         view.add_item(indicator_btn)
 
@@ -907,7 +1371,7 @@ class DatingCog(commands.Cog):
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
-                SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests, r.tier, r.overall_average, x.level
+                SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests, r.tier, r.overall_average, x.level, u.interested_in
                 FROM users u
                 LEFT JOIN profiles p ON u.user_id = p.user_id
                 LEFT JOIN rating_results r ON u.user_id = r.user_id
@@ -921,14 +1385,14 @@ class DatingCog(commands.Cog):
             if target_id == interaction.user.id:
                 await safe_respond(
                     interaction,
-                    content=f"❌ You have not created a profile yet! Please go to {ch_mention} and click **✏️ CREATE / EDIT PROFILE**.",
+                    content=f"❌ You have not created a profile yet! Please go to {ch_mention} and click **🆕 Create Profile**.",
                     ephemeral=True
                 )
             else:
                 await safe_respond(interaction, content="❌ This member has not created a dating profile yet.", ephemeral=True)
             return
 
-        photos = await resolve_photo_urls(self.bot, json.loads(row[4]) if row[4] else [])
+        media = await resolve_profile_media(self.bot, json.loads(row[4]) if row[4] else [])
         tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
 
         member = interaction.guild.get_member(target_id) if interaction.guild else None
@@ -938,14 +1402,19 @@ class DatingCog(commands.Cog):
         embed = discord.Embed(title=f"👤 Member Profile — <@{target_id}>{verified_badge}", color=config.PRIMARY_COLOR)
         embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
         embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
+        embed.add_field(name="Interested In", value=row[10] or "N/A", inline=True)
         embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
         embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=True)
         embed.add_field(name="Rating Tier", value=tier_str, inline=True)
         embed.add_field(name="Level", value=f"🏆 Level {row[9] or 1}", inline=True)
         embed.add_field(name="Bio", value=row[3] or "No bio provided.", inline=False)
 
-        if photos:
-            embed.set_image(url=photos[0])
+        primary_image = next((m["url"] for m in media if not m["is_video"]), None)
+        video_links = [m["url"] for m in media if m["is_video"]]
+        if primary_image:
+            embed.set_image(url=primary_image)
+        if video_links:
+            embed.add_field(name="🎥 Videos", value="\n".join(f"[Video {i+1}]({u})" for i, u in enumerate(video_links)), inline=False)
 
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
@@ -957,46 +1426,57 @@ class DatingCog(commands.Cog):
     @app_commands.command(name="profile-check", description="Post your profile publicly in #profile-check for review. Open to everyone (10 min cooldown).")
     @app_commands.checks.cooldown(1, 600.0, key=lambda i: i.user.id)
     async def profile_check_cmd(self, interaction: discord.Interaction):
-        if config.CHANNEL_PROFILE_CHECK and interaction.channel_id != config.CHANNEL_PROFILE_CHECK:
-            await safe_respond(
-                interaction,
-                content=f"❌ This command can only be executed inside <#{config.CHANNEL_PROFILE_CHECK}>!",
-                ephemeral=True
+        await interaction.response.defer(ephemeral=False)
+        try:
+            if config.CHANNEL_PROFILE_CHECK and interaction.channel_id != config.CHANNEL_PROFILE_CHECK:
+                await safe_respond(
+                    interaction,
+                    content=f"❌ This command can only be executed inside <#{config.CHANNEL_PROFILE_CHECK}>!",
+                    ephemeral=True
+                )
+                return
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("""
+                    SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests, r.tier, r.overall_average, u.interested_in
+                    FROM users u
+                    LEFT JOIN profiles p ON u.user_id = p.user_id
+                    LEFT JOIN rating_results r ON u.user_id = r.user_id
+                    WHERE u.user_id = ?
+                """, (interaction.user.id,)) as cursor:
+                    row = await cursor.fetchone()
+
+            if not row or not row[3]:
+                await safe_respond(interaction, content="❌ You have not created a dating profile yet! Set it up in `#my-profile` first.", ephemeral=True)
+                return
+
+            media = await resolve_profile_media(self.bot, json.loads(row[4]) if row[4] else [])
+            tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
+
+            is_verified = any(r.id == config.ROLE_VERIFIED for r in interaction.user.roles)
+            verified_badge = " ☑️ **Verified Member**" if is_verified else ""
+
+            embed = discord.Embed(
+                title=f"📝 PUBLIC PROFILE REVIEW — {interaction.user.display_name}{verified_badge}",
+                description=f"**About Me:** {row[3]}",
+                color=config.PRIMARY_COLOR
             )
-            return
+            embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
+            embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
+            embed.add_field(name="Interested In", value=row[9] or "N/A", inline=True)
+            embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
+            embed.add_field(name="Rating Tier", value=tier_str, inline=True)
+            embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=False)
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("""
-                SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests, r.tier, r.overall_average
-                FROM users u
-                LEFT JOIN profiles p ON u.user_id = p.user_id
-                LEFT JOIN rating_results r ON u.user_id = r.user_id
-                WHERE u.user_id = ?
-            """, (interaction.user.id,)) as cursor:
-                row = await cursor.fetchone()
+            primary_image = next((m["url"] for m in media if not m["is_video"]), None)
+            if primary_image:
+                embed.set_image(url=primary_image)
 
-        if not row or not row[3]:
-            await safe_respond(interaction, content="❌ You have not created a dating profile yet! Set it up in `#my-profile` first.", ephemeral=True)
-            return
-
-        photos = await resolve_photo_urls(self.bot, json.loads(row[4]) if row[4] else [])
-        verified_badge = " ☑️ **Verified Member**" if is_verified else ""
-
-        embed = discord.Embed(
-            title=f"📝 PUBLIC PROFILE REVIEW — {interaction.user.display_name}{verified_badge}",
-            description=f"**Bio:** {row[3]}",
-            color=config.PRIMARY_COLOR
-        )
-        embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
-        embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
-        embed.add_field(name="Rating Tier", value=tier_str, inline=True)
-        embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=False)
-
-        if photos:
-            embed.set_image(url=photos[0])
-
-        embed.set_footer(text="Community members can leave constructive feedback in thread/chat below!")
-        await safe_respond(interaction, embed=embed, ephemeral=False)
+            embed.set_footer(text="Community members can leave constructive feedback in thread/chat below!")
+            await safe_respond(interaction, embed=embed, ephemeral=False)
+        except Exception:
+            logger.exception("Error in /profile-check")
+            await safe_respond(interaction, content="❌ An error occurred posting your profile. Please try again.", ephemeral=True)
 
     @profile_check_cmd.error
     async def profile_check_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1008,6 +1488,9 @@ class DatingCog(commands.Cog):
                 content=f"⏳ Cooldown active: You can post another profile review in **{minutes}m {seconds}s**.",
                 ephemeral=True
             )
+        else:
+            logger.exception("Unhandled error in /profile-check", exc_info=error)
+            await safe_respond(interaction, content="❌ An unexpected error occurred.", ephemeral=True)
 
 
 async def setup(bot):
