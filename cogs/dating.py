@@ -292,10 +292,12 @@ async def show_media_step(interaction: discord.Interaction, cog):
 
 
 async def start_media_ticket(interaction: discord.Interaction, cog, mode: str, max_items: int):
-    if not interaction.guild:
-        await safe_respond(interaction, content="Please run this from within the server so I can create your media ticket.", ephemeral=True)
-        return
-    await cog.create_photo_ticket(interaction.guild, interaction.user, mode=mode, max_items=max_items)
+    if interaction.guild:
+        await cog.create_photo_ticket(interaction.guild, interaction.user, mode=mode, max_items=max_items)
+    else:
+        # Running from a DM (e.g. the onboarding flow) — post the upload
+        # request right here instead of requiring a guild channel.
+        await cog.create_dm_media_ticket(interaction.user, mode=mode, max_items=max_items)
 
 
 async def show_media_edit_choice(interaction: discord.Interaction, cog, current_count: int):
@@ -947,6 +949,16 @@ class DatingCog(commands.Cog):
                     continue
 
                 channel = self.bot.get_channel(channel_id)
+                if not channel:
+                    # Not in cache — likely a DM channel that didn't survive
+                    # the restart. Re-resolve it via the user directly.
+                    try:
+                        user = await self.bot.fetch_user(user_id)
+                        dm = await user.create_dm()
+                        if dm.id == channel_id:
+                            channel = dm
+                    except Exception:
+                        channel = None
                 if channel:
                     view = PhotoConfirmView(self, ticket_id, user_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS)
                     try:
@@ -1015,6 +1027,45 @@ class DatingCog(commands.Cog):
         task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel.id, user.id, PHOTO_TICKET_TIMEOUT))
         self._photo_ticket_monitors[ticket_id] = task
         return channel
+
+    async def create_dm_media_ticket(self, user: discord.User, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
+        """DM equivalent of create_photo_ticket: no guild channel is created —
+        the user's DM with the bot IS the ticket, since it's already private
+        by nature."""
+        try:
+            dm = await user.create_dm()
+        except Exception:
+            logger.exception("Failed to open DM for media ticket")
+            return None
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "INSERT INTO photo_tickets (user_id, channel_id, mode, max_items) VALUES (?, ?, ?, ?)",
+                (user.id, dm.id, mode, max_items)
+            )
+            ticket_id = cursor.lastrowid
+            await db.commit()
+
+        embed = discord.Embed(
+            title="Upload your profile media",
+            description=(
+                f"Upload up to {max_items} item(s) right here in this DM **as direct attachments** (photos or videos).\n"
+                "Pasted links are not supported — please upload the files themselves.\n"
+                "When you are happy with your media, press **Confirm Media** below.\n"
+                "If you do not confirm within 10 minutes this request will expire and you'll be notified."
+            ),
+            color=config.PRIMARY_COLOR
+        )
+        view = PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items)
+        try:
+            confirm_msg = await dm.send(embed=embed, view=view)
+            self._photo_ticket_confirm_msgs[dm.id] = confirm_msg.id
+        except Exception:
+            logger.exception("Failed to post confirm message in DM")
+
+        task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, dm.id, user.id, PHOTO_TICKET_TIMEOUT))
+        self._photo_ticket_monitors[ticket_id] = task
+        return dm
 
     async def _photo_ticket_monitor(self, ticket_id: int, channel_id: int, user_id: int, timeout: int = PHOTO_TICKET_TIMEOUT):
         try:
