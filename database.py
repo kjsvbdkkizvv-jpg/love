@@ -152,14 +152,19 @@ async def init_db():
             )
         """)
 
-        # Photo tickets table for attachment-based profile uploads
+        # Media tickets table for attachment-based profile photo/video uploads.
+        # mode: 'replace' (new profile or Clear & Replace) or 'append' (Add Media
+        # to an existing, incomplete media set). max_items: how many uploads this
+        # specific ticket will accept (e.g. remaining slots for an append ticket).
         await db.execute("""
             CREATE TABLE IF NOT EXISTS photo_tickets (
                 ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 channel_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                confirmed BOOLEAN DEFAULT 0
+                confirmed BOOLEAN DEFAULT 0,
+                mode TEXT DEFAULT 'replace',
+                max_items INTEGER DEFAULT 5
             )
         """)
 
