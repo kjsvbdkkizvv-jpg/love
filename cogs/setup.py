@@ -182,6 +182,16 @@ class SetupCog(commands.Cog):
         self.bot.add_view(ProfileManagementView())
         self.bot.add_view(OnboardingProfileView())
 
+        # Idempotent schema migration: tracks whether WE paused someone's
+        # dating_enabled because they left, so we know it's safe to restore
+        # on rejoin (vs. them having paused it themselves beforehand).
+        async with aiosqlite.connect(DB_PATH) as db:
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN left_server BOOLEAN DEFAULT 0")
+                await db.commit()
+            except Exception:
+                pass  # column already exists
+
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if before.roles == after.roles:
@@ -232,6 +242,95 @@ class SetupCog(commands.Cog):
 
         if config.ROLE_CREATE_DATING_PROFILE in after_ids and config.ROLE_CREATE_DATING_PROFILE not in before_ids:
             await self.trigger_onboarding_profile_setup(after)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """When someone leaves (or is kicked/banned), pull them out of the
+        discovery queue by reusing the existing dating_enabled pause flag —
+        but only if WE'RE the ones pausing it, so we know it's safe to
+        restore automatically if they rejoin later."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT dating_enabled FROM users WHERE user_id = ?", (member.id,)) as c:
+                row = await c.fetchone()
+            if row and row[0]:
+                await db.execute(
+                    "UPDATE users SET dating_enabled = 0, left_server = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (member.id,)
+                )
+                await db.commit()
+
+        # Abandon any unconfirmed media ticket — the ticket channel is now
+        # inaccessible to them anyway, so leaving it open just wastes space.
+        dating_cog = self.bot.get_cog("DatingCog")
+        if dating_cog:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT ticket_id, channel_id FROM photo_tickets WHERE user_id = ? AND confirmed = 0",
+                    (member.id,)
+                ) as c:
+                    pending_tickets = await c.fetchall()
+            for ticket_id, channel_id in pending_tickets:
+                task = dating_cog._photo_ticket_monitors.pop(ticket_id, None)
+                if task:
+                    task.cancel()
+                dating_cog._photo_ticket_confirm_msgs.pop(channel_id, None)
+                ch = self.bot.get_channel(channel_id)
+                if ch and not isinstance(ch, discord.DMChannel):
+                    try:
+                        await ch.delete(reason="User left the server — abandoning media ticket")
+                    except Exception:
+                        pass
+
+        # End any active match so the remaining partner isn't left stranded
+        # with someone who's gone. The ticket channel is left in place (with
+        # a notice) rather than deleted, so chat history isn't destroyed;
+        # the ephemeral voice room is safe to remove immediately.
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT match_id, user_a, user_b, ticket_channel_id, voice_channel_id FROM matches "
+                "WHERE status = 'ACTIVE' AND (user_a = ? OR user_b = ?)",
+                (member.id, member.id)
+            ) as c:
+                active_matches = await c.fetchall()
+
+            for match_id, *_ in active_matches:
+                await db.execute(
+                    "UPDATE matches SET status = 'ENDED_MEMBER_LEFT', closed_at = CURRENT_TIMESTAMP WHERE match_id = ?",
+                    (match_id,)
+                )
+            await db.commit()
+
+        for match_id, user_a, user_b, ticket_channel_id, voice_channel_id in active_matches:
+            other_id = user_b if user_a == member.id else user_a
+            if voice_channel_id:
+                vc = self.bot.get_channel(voice_channel_id)
+                if vc:
+                    try:
+                        await vc.delete(reason="Match partner left the server")
+                    except Exception:
+                        pass
+            if ticket_channel_id:
+                ch = self.bot.get_channel(ticket_channel_id)
+                if ch:
+                    try:
+                        await ch.send(f"💔 <@{other_id}>, your match partner has left the server. This ticket is now closed.")
+                    except Exception:
+                        pass
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """If we're the ones who paused their dating on the way out, restore
+        it automatically on rejoin. If they had paused it themselves before
+        leaving, respect that and leave it paused."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT left_server FROM users WHERE user_id = ?", (member.id,)) as c:
+                row = await c.fetchone()
+            if row and row[0]:
+                await db.execute(
+                    "UPDATE users SET dating_enabled = 1, left_server = 0, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (member.id,)
+                )
+                await db.commit()
 
     async def trigger_onboarding_profile_setup(self, member: discord.Member):
         # No age-role check here either — see create_profile for why. The
