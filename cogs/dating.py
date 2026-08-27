@@ -734,31 +734,25 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = media_index
         self.cog = cog
 
-    async def update_message(self, interaction: discord.Interaction = None, message: discord.Message = None):
-        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild if interaction else None)
-        try:
-            if interaction and interaction.response.is_done():
-                await interaction.followup.edit_message(message.id, embed=embed, view=self)
-            elif message:
-                await message.edit(embed=embed, view=self)
-            elif interaction:
-                await interaction.response.edit_message(embed=embed, view=self)
-        except Exception:
-            pass
-
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
     async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
         media = self.candidate.get("media", [])
-        if media:
-            self.media_index = (self.media_index - 1) % len(media)
-            await self.update_message(interaction, message=interaction.message)
+        if not media:
+            await interaction.response.defer()
+            return
+        self.media_index = (self.media_index - 1) % len(media)
+        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
         media = self.candidate.get("media", [])
-        if media:
-            self.media_index = (self.media_index + 1) % len(media)
-            await self.update_message(interaction, message=interaction.message)
+        if not media:
+            await interaction.response.defer()
+            return
+        self.media_index = (self.media_index + 1) % len(media)
+        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -789,34 +783,47 @@ class DiscoveryCardView(discord.ui.View):
             except Exception:
                 logger.exception("Failed to create match ticket")
                 await safe_respond(interaction, content="⚠️ Match detected but failed to create ticket.", ephemeral=True)
-        else:
-            await safe_respond(interaction, content="❤️ Recorded like!", ephemeral=True)
 
-        await self.cog.serve_next_candidate(interaction)
+        # Transition straight to the next card in place (like a swipe) rather
+        # than stacking a separate confirmation message on top of the old card.
+        await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="❌ PASS", style=discord.ButtonStyle.secondary, custom_id=config.ID_DISCOVERY_PASS)
     async def handle_pass(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Pass = simply skip this profile and move to the next one. No
+        # lasting relationship between the two users beyond "don't show me
+        # this person again" — unlike Block, it's not mutual or permanent
+        # in terms of contact, and doesn't prevent them from finding you.
         await interaction.response.defer(ephemeral=True)
         try:
             await self.cog.record_pass(interaction.user.id, self.candidate["user_id"])
-            await safe_respond(interaction, content="❌ Passed.", ephemeral=True)
         except Exception:
             logger.exception("Failed to record pass")
             await safe_respond(interaction, content="⚠️ Failed to process pass.", ephemeral=True)
-        await self.cog.serve_next_candidate(interaction)
+            return
+        await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="🚫 BLOCK", style=discord.ButtonStyle.danger, custom_id=config.ID_DISCOVERY_BLOCK)
     async def handle_block(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Block = a permanent, mutual safety action: unlike Pass, it stops
+        # BOTH people from ever seeing, matching with, or contacting each
+        # other again (enforced in validate_dating_contact and profile
+        # viewing), regardless of who blocked whom.
         await interaction.response.defer(ephemeral=True)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("INSERT OR IGNORE INTO blocks (user_id, blocked_user_id) VALUES (?, ?)", (interaction.user.id, self.candidate["user_id"]))
                 await db.commit()
-            await safe_respond(interaction, content="🚫 Candidate blocked permanently.", ephemeral=True)
         except Exception:
             logger.exception("Failed to block candidate")
-            await safe_respond(interaction, content="⚠️ Failed to block candidate.", ephemeral=True)
-        await self.cog.serve_next_candidate(interaction)
+            await safe_respond(interaction, content="⚠️ Failed to block this person.", ephemeral=True)
+            return
+        await safe_respond(
+            interaction,
+            content="🚫 **Blocked.** Unlike Pass, this is mutual and permanent — you will no longer be able to see, match with, or view each other's profiles.",
+            ephemeral=True
+        )
+        await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id="discovery:info")
     async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -825,6 +832,46 @@ class DiscoveryCardView(discord.ui.View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Unhandled error in DiscoveryCardView item %r", item)
         await safe_respond(interaction, content="⚠️ Something went wrong processing that action. Please try again.", ephemeral=True)
+
+
+class ProfileMediaView(discord.ui.View):
+    """Read-only media carousel for /profile, /profile-check, and self-view —
+    Prev/Next navigation only, no dating actions. If owner_id is None, anyone
+    can navigate (used for the public /profile-check post); otherwise only
+    that user can (used for ephemeral profile views)."""
+
+    def __init__(self, embed_builder, media_count: int, owner_id: Optional[int] = None, timeout: int = 600):
+        super().__init__(timeout=timeout)
+        self.embed_builder = embed_builder  # callable(index) -> discord.Embed
+        self.media_count = media_count
+        self.owner_id = owner_id
+        self.index = 0
+        if media_count <= 1:
+            self.clear_items()
+
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id is not None and interaction.user.id != self.owner_id:
+            await safe_respond(interaction, content="This isn't your profile view.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary)
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        self.index = (self.index - 1) % self.media_count
+        await interaction.response.edit_message(embed=self.embed_builder(self.index), view=self)
+
+    @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        self.index = (self.index + 1) % self.media_count
+        await interaction.response.edit_message(embed=self.embed_builder(self.index), view=self)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in ProfileMediaView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong.", ephemeral=True)
 
 
 async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
@@ -1275,13 +1322,13 @@ class DatingCog(commands.Cog):
             if member and any(r.id == config.ROLE_VERIFIED for r in member.roles):
                 is_verified = True
 
-        verified_badge = " ☑️ **Verified Member**" if is_verified else ""
+        verified_badge = " ☑️ **Verified**" if is_verified else ""
         tier_str = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate.get('average_score') else candidate['tier']
         interests_str = " · ".join(candidate.get("interests") or []) if candidate.get("interests") else "None specified"
 
         embed = discord.Embed(
-            title=f"👤 Member Profile — {candidate.get('age_group')}{verified_badge}",
-            description=f"**About Me:** {candidate.get('bio')}",
+            title=f"👤 Member Profile — {candidate.get('age_group')}",
+            description=f"<@{candidate['user_id']}>{verified_badge}\n**About Me:** {candidate.get('bio')}",
             color=config.PRIMARY_COLOR
         )
         embed.add_field(name="⚧ Gender", value=candidate.get('gender') or "Unspecified", inline=True)
@@ -1352,7 +1399,7 @@ class DatingCog(commands.Cog):
             pass
         return channel
 
-    async def serve_next_candidate(self, interaction: discord.Interaction):
+    async def serve_next_candidate(self, interaction: discord.Interaction, edit_message_id: int = None):
         missing = await get_missing_dating_requirements(interaction.user.id)
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
@@ -1367,20 +1414,30 @@ class DatingCog(commands.Cog):
             else:
                 profile_link = f"<#{config.CHANNEL_MY_PROFILE}>"
             still_needed = (["a profile with About Me"] if not has_bio else []) + missing
-            await safe_respond(
-                interaction,
-                content=(
-                    "❌ You need to complete your dating profile before you can start discovering matches!\n"
-                    f"Still needed: {', '.join(still_needed)}.\n"
-                    f"Head to {profile_link} to finish setting up."
-                ),
-                ephemeral=True
+            content = (
+                "❌ You need to complete your dating profile before you can start discovering matches!\n"
+                f"Still needed: {', '.join(still_needed)}.\n"
+                f"Head to {profile_link} to finish setting up."
             )
+            if edit_message_id:
+                try:
+                    await interaction.followup.edit_message(edit_message_id, content=content, embed=None, view=None)
+                    return
+                except Exception:
+                    pass
+            await safe_respond(interaction, content=content, ephemeral=True)
             return
 
         candidate = await self.get_weighted_candidate(interaction.user.id)
         if not candidate:
-            await safe_respond(interaction, content="🎉 You have viewed all available candidate profiles in your pool for now!", ephemeral=True)
+            content = "🎉 You have viewed all available candidate profiles in your pool for now!"
+            if edit_message_id:
+                try:
+                    await interaction.followup.edit_message(edit_message_id, content=content, embed=None, view=None)
+                    return
+                except Exception:
+                    pass
+            await safe_respond(interaction, content=content, ephemeral=True)
             return
 
         embed = self.build_discovery_embed(candidate, guild=interaction.guild)
@@ -1393,7 +1450,8 @@ class DatingCog(commands.Cog):
 
             async def jump_callback(interaction2: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
                 viewref.media_index = index
-                await viewref.update_message(interaction2, message=interaction2.message)
+                jump_embed = self.build_discovery_embed(viewref.candidate, index, guild=interaction2.guild)
+                await interaction2.response.edit_message(embed=jump_embed, view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1406,6 +1464,12 @@ class DatingCog(commands.Cog):
         indicator_btn = discord.ui.Button(label=indicator_label, style=discord.ButtonStyle.gray, disabled=True, custom_id=f"discovery:indicator:{interaction.user.id}:{random.randint(1,100000)}")
         view.add_item(indicator_btn)
 
+        if edit_message_id:
+            try:
+                await interaction.followup.edit_message(edit_message_id, content=None, embed=embed, view=view)
+                return
+            except Exception:
+                pass
         await safe_respond(interaction, embed=embed, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
@@ -1420,6 +1484,17 @@ class DatingCog(commands.Cog):
         await safe_respond(interaction, embed=embed, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
+        if interaction.user.id != target_id:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT 1 FROM blocks WHERE (user_id = ? AND blocked_user_id = ?) OR (user_id = ? AND blocked_user_id = ?)",
+                    (interaction.user.id, target_id, target_id, interaction.user.id)
+                ) as c:
+                    blocked = await c.fetchone()
+            if blocked:
+                await safe_respond(interaction, content="❌ This profile is unavailable.", ephemeral=True)
+                return
+
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests, r.tier, r.overall_average, x.level, u.interested_in
@@ -1447,27 +1522,30 @@ class DatingCog(commands.Cog):
         tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
 
         member = interaction.guild.get_member(target_id) if interaction.guild else None
-        is_verified = member and any(r.id == config.ROLE_VERIFIED for r in member.roles)
-        verified_badge = " ☑️ **Verified Member**" if is_verified else ""
+        is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
+        verified_badge = " ☑️ **Verified**" if is_verified else ""
 
-        embed = discord.Embed(title=f"👤 Member Profile — <@{target_id}>{verified_badge}", color=config.PRIMARY_COLOR)
-        embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
-        embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
-        embed.add_field(name="Interested In", value=row[10] or "N/A", inline=True)
-        embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
-        embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=True)
-        embed.add_field(name="Rating Tier", value=tier_str, inline=True)
-        embed.add_field(name="Level", value=f"🏆 Level {row[9] or 1}", inline=True)
-        embed.add_field(name="Bio", value=row[3] or "No bio provided.", inline=False)
+        def build_embed(index: int) -> discord.Embed:
+            current = media[index] if media else None
+            embed = discord.Embed(title="👤 Member Profile", color=config.PRIMARY_COLOR)
+            embed.description = f"<@{target_id}>{verified_badge}\n**Bio:** {row[3] or 'No bio provided.'}"
+            embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
+            embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
+            embed.add_field(name="Interested In", value=row[10] or "N/A", inline=True)
+            embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
+            embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=True)
+            embed.add_field(name="Rating Tier", value=tier_str, inline=True)
+            embed.add_field(name="Level", value=f"🏆 Level {row[9] or 1}", inline=True)
+            if current and not current["is_video"]:
+                embed.set_image(url=current["url"])
+            elif current and current["is_video"]:
+                embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
+            if media:
+                embed.set_footer(text=f"Media {index + 1} of {len(media)}")
+            return embed
 
-        primary_image = next((m["url"] for m in media if not m["is_video"]), None)
-        video_links = [m["url"] for m in media if m["is_video"]]
-        if primary_image:
-            embed.set_image(url=primary_image)
-        if video_links:
-            embed.add_field(name="🎥 Videos", value="\n".join(f"[Video {i+1}]({u})" for i, u in enumerate(video_links)), inline=False)
-
-        await safe_respond(interaction, embed=embed, ephemeral=True)
+        view = ProfileMediaView(build_embed, len(media), owner_id=interaction.user.id) if media else None
+        await safe_respond(interaction, embed=build_embed(0), view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     async def view_profile_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
@@ -1505,26 +1583,31 @@ class DatingCog(commands.Cog):
             tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
 
             is_verified = any(r.id == config.ROLE_VERIFIED for r in interaction.user.roles)
-            verified_badge = " ☑️ **Verified Member**" if is_verified else ""
+            verified_badge = " ☑️ **Verified**" if is_verified else ""
 
-            embed = discord.Embed(
-                title=f"📝 PUBLIC PROFILE REVIEW — {interaction.user.display_name}{verified_badge}",
-                description=f"**About Me:** {row[3]}",
-                color=config.PRIMARY_COLOR
-            )
-            embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
-            embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
-            embed.add_field(name="Interested In", value=row[9] or "N/A", inline=True)
-            embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
-            embed.add_field(name="Rating Tier", value=tier_str, inline=True)
-            embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=False)
+            def build_embed(index: int) -> discord.Embed:
+                current = media[index] if media else None
+                embed = discord.Embed(title="📝 PUBLIC PROFILE REVIEW", color=config.PRIMARY_COLOR)
+                embed.description = f"{interaction.user.mention}{verified_badge}\n**About Me:** {row[3]}"
+                embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
+                embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
+                embed.add_field(name="Interested In", value=row[9] or "N/A", inline=True)
+                embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
+                embed.add_field(name="Rating Tier", value=tier_str, inline=True)
+                embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=False)
+                if current and not current["is_video"]:
+                    embed.set_image(url=current["url"])
+                elif current and current["is_video"]:
+                    embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
+                footer = "Community members can leave constructive feedback in thread/chat below!"
+                if media:
+                    footer = f"Media {index + 1} of {len(media)} • {footer}"
+                embed.set_footer(text=footer)
+                return embed
 
-            primary_image = next((m["url"] for m in media if not m["is_video"]), None)
-            if primary_image:
-                embed.set_image(url=primary_image)
-
-            embed.set_footer(text="Community members can leave constructive feedback in thread/chat below!")
-            await safe_respond(interaction, embed=embed, ephemeral=False)
+            # Public post — anyone viewing can flip through the media (owner_id=None)
+            view = ProfileMediaView(build_embed, len(media), owner_id=None) if media else None
+            await safe_respond(interaction, embed=build_embed(0), view=view, ephemeral=False)
         except Exception:
             logger.exception("Error in /profile-check")
             await safe_respond(interaction, content="❌ An error occurred posting your profile. Please try again.", ephemeral=True)
