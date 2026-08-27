@@ -7,10 +7,15 @@ import random
 import json
 import datetime
 import logging
-from typing import List, Optional
+import io
+import functools
+from typing import List, Optional, Tuple
+
+import aiohttp
 
 import config
 from database import DB_PATH
+from card_renderer import render_profile_card
 
 logger = logging.getLogger("LooksMatch.Dating")
 
@@ -63,6 +68,86 @@ async def resolve_profile_media(bot: commands.Bot, media_items) -> List[dict]:
             # Message id invalid/legacy entry, or message deleted from vault — skip it.
             continue
     return resolved
+
+
+async def fetch_media_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+    """Downloads raw image bytes for card rendering. Returns None on any
+    failure — the renderer already draws a graceful placeholder box."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                return await resp.read()
+    except Exception:
+        logger.exception("Failed to fetch media bytes for card rendering")
+    return None
+
+
+async def build_card_file(
+    session: aiohttp.ClientSession,
+    media: List[dict],
+    active_index: int,
+    *,
+    display_name: str,
+    age_group: Optional[str],
+    location: Optional[str],
+    is_verified: bool,
+    tier_text: Optional[str],
+    gender: Optional[str],
+    interested_in: Optional[str],
+    interests: List[str],
+    dating_intent: Optional[str],
+    bio: Optional[str],
+    cache: Optional[dict] = None,
+) -> discord.File:
+    """Fetches whatever photo bytes are needed and renders the full image
+    card, returning a ready-to-send discord.File. `cache` (keyed by media
+    index) lets a single card session — e.g. flipping through media on the
+    same discovery card — avoid re-downloading images it already has."""
+    thumbnails: List[Tuple[Optional[bytes], bool]] = []
+    for i, item in enumerate((media or [])[:5]):
+        is_vid = item.get("is_video", False)
+        if is_vid:
+            # No frame extraction — videos render as a placeholder + play icon.
+            thumbnails.append((None, True))
+            continue
+        if cache is not None and i in cache:
+            thumbnails.append((cache[i], False))
+            continue
+        data = await fetch_media_bytes(session, item["url"])
+        if cache is not None:
+            cache[i] = data
+        thumbnails.append((data, False))
+
+    main_bytes = None
+    is_video_active = False
+    if media and 0 <= active_index < len(media):
+        active_item = media[active_index]
+        is_video_active = active_item.get("is_video", False)
+        if not is_video_active and active_index < len(thumbnails):
+            main_bytes = thumbnails[active_index][0]
+
+    loop = asyncio.get_event_loop()
+    png_bytes = await loop.run_in_executor(
+        None,
+        functools.partial(
+            render_profile_card,
+            main_image_bytes=main_bytes,
+            is_video=is_video_active,
+            thumbnails=thumbnails,
+            active_index=active_index,
+            display_name=display_name,
+            age_group=age_group,
+            location=location,
+            is_verified=is_verified,
+            tier_text=tier_text,
+            gender=gender,
+            interested_in=interested_in,
+            interests=interests,
+            dating_intent=dating_intent,
+            bio=bio,
+        )
+    )
+    return discord.File(io.BytesIO(png_bytes), filename="profile_card.png")
 
 
 async def safe_respond(interaction: discord.Interaction, /, *, content=None, embed=None, view=None, ephemeral=True, **kwargs):
@@ -733,6 +818,10 @@ class DiscoveryCardView(discord.ui.View):
         self.candidate = candidate
         self.media_index = media_index
         self.cog = cog
+        self._media_cache: dict = {}  # avoids re-downloading unchanged thumbnails while flipping
+
+    async def _render_file(self, guild: discord.Guild) -> discord.File:
+        return await self.cog.build_discovery_card_file(self.candidate, self.media_index, guild, cache=self._media_cache)
 
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
     async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -741,8 +830,9 @@ class DiscoveryCardView(discord.ui.View):
             await interaction.response.defer()
             return
         self.media_index = (self.media_index - 1) % len(media)
-        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.defer()
+        file = await self._render_file(interaction.guild)
+        await interaction.edit_original_response(attachments=[file], view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -751,8 +841,9 @@ class DiscoveryCardView(discord.ui.View):
             await interaction.response.defer()
             return
         self.media_index = (self.media_index + 1) % len(media)
-        embed = self.cog.build_discovery_embed(self.candidate, self.media_index, guild=interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.defer()
+        file = await self._render_file(interaction.guild)
+        await interaction.edit_original_response(attachments=[file], view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -835,19 +926,42 @@ class DiscoveryCardView(discord.ui.View):
 
 
 class ProfileMediaView(discord.ui.View):
-    """Read-only media carousel for /profile, /profile-check, and self-view —
-    Prev/Next navigation only, no dating actions. If owner_id is None, anyone
-    can navigate (used for the public /profile-check post); otherwise only
-    that user can (used for ephemeral profile views)."""
+    """Read-only image-card media carousel for /profile, /profile-check, and
+    self-view — Prev/Next navigation only, no dating actions. If owner_id is
+    None, anyone can navigate (used for the public /profile-check post);
+    otherwise only that user can (used for ephemeral profile views)."""
 
-    def __init__(self, embed_builder, media_count: int, owner_id: Optional[int] = None, timeout: int = 600):
+    def __init__(self, cog, media: List[dict], owner_id: Optional[int], *, display_name: str,
+                 age_group: Optional[str], location: Optional[str], is_verified: bool,
+                 tier_text: Optional[str], gender: Optional[str], interested_in: Optional[str],
+                 interests: List[str], dating_intent: Optional[str], bio: Optional[str], timeout: int = 600):
         super().__init__(timeout=timeout)
-        self.embed_builder = embed_builder  # callable(index) -> discord.Embed
-        self.media_count = media_count
+        self.cog = cog
+        self.media = media or []
         self.owner_id = owner_id
         self.index = 0
-        if media_count <= 1:
+        self._cache: dict = {}
+        self.display_name = display_name
+        self.age_group = age_group
+        self.location = location
+        self.is_verified = is_verified
+        self.tier_text = tier_text
+        self.gender = gender
+        self.interested_in = interested_in
+        self.interests = interests
+        self.dating_intent = dating_intent
+        self.bio = bio
+        if len(self.media) <= 1:
             self.clear_items()
+
+    async def render_file(self) -> discord.File:
+        return await build_card_file(
+            self.cog._http_session, self.media, self.index,
+            display_name=self.display_name, age_group=self.age_group, location=self.location,
+            is_verified=self.is_verified, tier_text=self.tier_text, gender=self.gender,
+            interested_in=self.interested_in, interests=self.interests or [],
+            dating_intent=self.dating_intent, bio=self.bio, cache=self._cache
+        )
 
     async def _check_owner(self, interaction: discord.Interaction) -> bool:
         if self.owner_id is not None and interaction.user.id != self.owner_id:
@@ -859,15 +973,19 @@ class ProfileMediaView(discord.ui.View):
     async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
-        self.index = (self.index - 1) % self.media_count
-        await interaction.response.edit_message(embed=self.embed_builder(self.index), view=self)
+        self.index = (self.index - 1) % len(self.media)
+        await interaction.response.defer()
+        file = await self.render_file()
+        await interaction.edit_original_response(attachments=[file], view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
-        self.index = (self.index + 1) % self.media_count
-        await interaction.response.edit_message(embed=self.embed_builder(self.index), view=self)
+        self.index = (self.index + 1) % len(self.media)
+        await interaction.response.defer()
+        file = await self.render_file()
+        await interaction.edit_original_response(attachments=[file], view=self)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in ProfileMediaView item %r", item)
@@ -902,9 +1020,11 @@ class DatingCog(commands.Cog):
         self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
         self._photo_ticket_monitors = {}  # ticket_id -> task
         self._confirming_tickets = set()  # in-memory spam-click guard
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
     async def cog_load(self):
         self.voice_cleanup_task.start()
+        self._http_session = aiohttp.ClientSession()
         # Idempotent schema migration for existing deployments: add mode/max_items
         # to photo_tickets if they aren't already there.
         async with aiosqlite.connect(DB_PATH) as db:
@@ -919,10 +1039,12 @@ class DatingCog(commands.Cog):
                     pass  # column already exists
         asyncio.create_task(self._recover_photo_tickets())
 
-    def cog_unload(self):
+    async def cog_unload(self):
         self.voice_cleanup_task.cancel()
         for t in self._photo_ticket_monitors.values():
             t.cancel()
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
 
     @tasks.loop(minutes=1)
     async def voice_cleanup_task(self):
@@ -1312,41 +1434,28 @@ class DatingCog(commands.Cog):
 
         return None
 
-    def build_discovery_embed(self, candidate: dict, media_index: int = 0, guild: discord.Guild = None) -> discord.Embed:
-        media = candidate.get("media", [])
-        current = media[media_index] if media else None
+    async def build_discovery_card_file(self, candidate: dict, media_index: int, guild: discord.Guild, cache: dict = None) -> discord.File:
+        member = guild.get_member(candidate["user_id"]) if guild else None
+        display_name = member.display_name if member else f"Member {str(candidate['user_id'])[-4:]}"
+        is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
+        tier_text = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate.get('average_score') else candidate.get('tier')
 
-        is_verified = False
-        if guild:
-            member = guild.get_member(candidate["user_id"])
-            if member and any(r.id == config.ROLE_VERIFIED for r in member.roles):
-                is_verified = True
-
-        verified_badge = " ☑️ **Verified**" if is_verified else ""
-        tier_str = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate.get('average_score') else candidate['tier']
-        interests_str = " · ".join(candidate.get("interests") or []) if candidate.get("interests") else "None specified"
-
-        embed = discord.Embed(
-            title=f"👤 Member Profile — {candidate.get('age_group')}",
-            description=f"<@{candidate['user_id']}>{verified_badge}\n**About Me:** {candidate.get('bio')}",
-            color=config.PRIMARY_COLOR
+        return await build_card_file(
+            self._http_session,
+            candidate.get("media", []),
+            media_index,
+            display_name=display_name,
+            age_group=candidate.get('age_group'),
+            location=candidate.get('location'),
+            is_verified=is_verified,
+            tier_text=tier_text,
+            gender=candidate.get('gender'),
+            interested_in=candidate.get('interested_in'),
+            interests=candidate.get('interests') or [],
+            dating_intent=candidate.get('dating_intent'),
+            bio=candidate.get('bio'),
+            cache=cache,
         )
-        embed.add_field(name="⚧ Gender", value=candidate.get('gender') or "Unspecified", inline=True)
-        embed.add_field(name="❤️ Interested In", value=candidate.get('interested_in') or "Unspecified", inline=True)
-        embed.add_field(name="📍 Location", value=candidate.get('location') or "Unknown", inline=True)
-        embed.add_field(name="🎯 Intent", value=candidate.get('dating_intent') or "Not specified", inline=True)
-        embed.add_field(name="📊 Rating Tier", value=f"**{tier_str}**", inline=True)
-        embed.add_field(name="🎵 Interests", value=interests_str, inline=False)
-
-        if current and not current["is_video"]:
-            embed.set_image(url=current["url"])
-        elif current and current["is_video"]:
-            embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
-
-        if media:
-            embed.set_footer(text=f"Media {media_index + 1} of {len(media)}")
-
-        return embed
 
     async def record_like(self, liker_id: int, target_id: int) -> bool:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1421,7 +1530,7 @@ class DatingCog(commands.Cog):
             )
             if edit_message_id:
                 try:
-                    await interaction.followup.edit_message(edit_message_id, content=content, embed=None, view=None)
+                    await interaction.followup.edit_message(edit_message_id, content=content, attachments=[], view=None)
                     return
                 except Exception:
                     pass
@@ -1433,15 +1542,15 @@ class DatingCog(commands.Cog):
             content = "🎉 You have viewed all available candidate profiles in your pool for now!"
             if edit_message_id:
                 try:
-                    await interaction.followup.edit_message(edit_message_id, content=content, embed=None, view=None)
+                    await interaction.followup.edit_message(edit_message_id, content=content, attachments=[], view=None)
                     return
                 except Exception:
                     pass
             await safe_respond(interaction, content=content, ephemeral=True)
             return
 
-        embed = self.build_discovery_embed(candidate, guild=interaction.guild)
         view = DiscoveryCardView(candidate, 0, self)
+        file = await self.build_discovery_card_file(candidate, 0, interaction.guild, cache=view._media_cache)
 
         media = candidate.get('media', [])
         max_media = min(5, len(media))
@@ -1450,8 +1559,9 @@ class DatingCog(commands.Cog):
 
             async def jump_callback(interaction2: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
                 viewref.media_index = index
-                jump_embed = self.build_discovery_embed(viewref.candidate, index, guild=interaction2.guild)
-                await interaction2.response.edit_message(embed=jump_embed, view=viewref)
+                await interaction2.response.defer()
+                jump_file = await viewref._render_file(interaction2.guild)
+                await interaction2.edit_original_response(attachments=[jump_file], view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1466,11 +1576,11 @@ class DatingCog(commands.Cog):
 
         if edit_message_id:
             try:
-                await interaction.followup.edit_message(edit_message_id, content=None, embed=embed, view=view)
+                await interaction.followup.edit_message(edit_message_id, content=None, attachments=[file], view=view)
                 return
             except Exception:
                 pass
-        await safe_respond(interaction, embed=embed, view=view, ephemeral=True)
+        await safe_respond(interaction, file=file, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
         candidate = await self.get_next_liked_you_candidate(interaction.user.id)
@@ -1478,10 +1588,9 @@ class DatingCog(commands.Cog):
             await safe_respond(interaction, content="🤩 No new profiles currently waiting in your Liked You feed!", ephemeral=True)
             return
 
-        embed = self.build_discovery_embed(candidate, guild=interaction.guild)
-        embed.title = f"🤩 Liked Your Profile — {candidate['age_group']}"
         view = DiscoveryCardView(candidate, 0, self)
-        await safe_respond(interaction, embed=embed, view=view, ephemeral=True)
+        file = await self.build_discovery_card_file(candidate, 0, interaction.guild, cache=view._media_cache)
+        await safe_respond(interaction, content="🤩 **This person liked your profile!**", file=file, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
         if interaction.user.id != target_id:
@@ -1519,33 +1628,35 @@ class DatingCog(commands.Cog):
             return
 
         media = await resolve_profile_media(self.bot, json.loads(row[4]) if row[4] else [])
-        tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
+        tier_base = f"{row[7]} · {row[8]}/10" if row[8] else (row[7] or None)
+        level_val = row[9] or 1
+        tier_str = f"{tier_base} · Lvl {level_val}" if tier_base else f"Lvl {level_val}"
 
         member = interaction.guild.get_member(target_id) if interaction.guild else None
+        display_name = member.display_name if member else f"Member {str(target_id)[-4:]}"
         is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
-        verified_badge = " ☑️ **Verified**" if is_verified else ""
+        interests_list = json.loads(row[6]) if row[6] else []
 
-        def build_embed(index: int) -> discord.Embed:
-            current = media[index] if media else None
-            embed = discord.Embed(title="👤 Member Profile", color=config.PRIMARY_COLOR)
-            embed.description = f"<@{target_id}>{verified_badge}\n**Bio:** {row[3] or 'No bio provided.'}"
-            embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
-            embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
-            embed.add_field(name="Interested In", value=row[10] or "N/A", inline=True)
-            embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
-            embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=True)
-            embed.add_field(name="Rating Tier", value=tier_str, inline=True)
-            embed.add_field(name="Level", value=f"🏆 Level {row[9] or 1}", inline=True)
-            if current and not current["is_video"]:
-                embed.set_image(url=current["url"])
-            elif current and current["is_video"]:
-                embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
-            if media:
-                embed.set_footer(text=f"Media {index + 1} of {len(media)}")
-            return embed
+        view = ProfileMediaView(
+            self, media, owner_id=interaction.user.id,
+            display_name=display_name, age_group=row[0], location=row[2],
+            is_verified=is_verified, tier_text=tier_str, gender=row[1],
+            interested_in=row[10], interests=interests_list,
+            dating_intent=row[5], bio=row[3],
+        ) if media else None
 
-        view = ProfileMediaView(build_embed, len(media), owner_id=interaction.user.id) if media else None
-        await safe_respond(interaction, embed=build_embed(0), view=view, ephemeral=True)
+        if view:
+            file = await view.render_file()
+        else:
+            file = await build_card_file(
+                self._http_session, [], 0,
+                display_name=display_name, age_group=row[0], location=row[2],
+                is_verified=is_verified, tier_text=tier_str, gender=row[1],
+                interested_in=row[10], interests=interests_list,
+                dating_intent=row[5], bio=row[3],
+            )
+
+        await safe_respond(interaction, file=file, view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     async def view_profile_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
@@ -1580,34 +1691,35 @@ class DatingCog(commands.Cog):
                 return
 
             media = await resolve_profile_media(self.bot, json.loads(row[4]) if row[4] else [])
-            tier_str = f"{row[7]} · {row[8]}/10" if row[8] else row[7] or "Unrated"
-
+            tier_str = f"{row[7]} · {row[8]}/10" if row[8] else (row[7] or None)
             is_verified = any(r.id == config.ROLE_VERIFIED for r in interaction.user.roles)
-            verified_badge = " ☑️ **Verified**" if is_verified else ""
-
-            def build_embed(index: int) -> discord.Embed:
-                current = media[index] if media else None
-                embed = discord.Embed(title="📝 PUBLIC PROFILE REVIEW", color=config.PRIMARY_COLOR)
-                embed.description = f"{interaction.user.mention}{verified_badge}\n**About Me:** {row[3]}"
-                embed.add_field(name="Age Group", value=row[0] or "N/A", inline=True)
-                embed.add_field(name="Gender", value=row[1] or "N/A", inline=True)
-                embed.add_field(name="Interested In", value=row[9] or "N/A", inline=True)
-                embed.add_field(name="Location", value=row[2] or "N/A", inline=True)
-                embed.add_field(name="Rating Tier", value=tier_str, inline=True)
-                embed.add_field(name="Dating Intent", value=row[5] or "N/A", inline=False)
-                if current and not current["is_video"]:
-                    embed.set_image(url=current["url"])
-                elif current and current["is_video"]:
-                    embed.add_field(name="🎥 Video", value=f"[Click to view]({current['url']})", inline=False)
-                footer = "Community members can leave constructive feedback in thread/chat below!"
-                if media:
-                    footer = f"Media {index + 1} of {len(media)} • {footer}"
-                embed.set_footer(text=footer)
-                return embed
+            interests_list = json.loads(row[6]) if row[6] else []
 
             # Public post — anyone viewing can flip through the media (owner_id=None)
-            view = ProfileMediaView(build_embed, len(media), owner_id=None) if media else None
-            await safe_respond(interaction, embed=build_embed(0), view=view, ephemeral=False)
+            view = ProfileMediaView(
+                self, media, owner_id=None,
+                display_name=interaction.user.display_name, age_group=row[0], location=row[2],
+                is_verified=is_verified, tier_text=tier_str, gender=row[1],
+                interested_in=row[9], interests=interests_list,
+                dating_intent=row[5], bio=row[3],
+            ) if media else None
+
+            if view:
+                file = await view.render_file()
+            else:
+                file = await build_card_file(
+                    self._http_session, [], 0,
+                    display_name=interaction.user.display_name, age_group=row[0], location=row[2],
+                    is_verified=is_verified, tier_text=tier_str, gender=row[1],
+                    interested_in=row[9], interests=interests_list,
+                    dating_intent=row[5], bio=row[3],
+                )
+
+            await safe_respond(
+                interaction,
+                content="📝 **PUBLIC PROFILE REVIEW** — community members can leave feedback below!",
+                file=file, view=view, ephemeral=False
+            )
         except Exception:
             logger.exception("Error in /profile-check")
             await safe_respond(interaction, content="❌ An error occurred posting your profile. Please try again.", ephemeral=True)
