@@ -76,6 +76,10 @@ class ProfileManagementView(discord.ui.View):
 
     @discord.ui.button(label="👤 VIEW PROFILE", style=discord.ButtonStyle.primary, custom_id=config.ID_VIEW_PROFILE)
     async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer immediately — building the profile card involves several
+        # Discord API calls plus image download/compositing, which can
+        # exceed the 3s ack window (esp. on a cold first call).
+        await interaction.response.defer(ephemeral=True)
         dating_cog = get_dating_cog(interaction.client)
         if not dating_cog:
             await safe_respond(interaction, content="⚠️ Dating system is currently unavailable.", ephemeral=True)
