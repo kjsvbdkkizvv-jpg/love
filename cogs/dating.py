@@ -82,7 +82,37 @@ async def fetch_media_bytes(session: aiohttp.ClientSession, url: str) -> Optiona
     return None
 
 
-async def build_card_file(
+MAX_VIDEO_ATTACH_BYTES = 24 * 1024 * 1024  # stay safely under Discord's 25MB default upload limit
+
+
+async def fetch_video_file(session: aiohttp.ClientSession, url: str) -> Optional[discord.File]:
+    """Downloads the actual video so Discord can attach and natively play it
+    (a PNG card can never play video — only a real video attachment can).
+    Returns None if the file is missing or too large to attach; the card
+    itself always shows a 'view original' style link as a fallback."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return None
+            content_length = resp.content_length
+            if content_length and content_length > MAX_VIDEO_ATTACH_BYTES:
+                return None
+            data = await resp.read()
+            if len(data) > MAX_VIDEO_ATTACH_BYTES:
+                return None
+            ext = "mp4"
+            content_type = resp.headers.get("Content-Type", "")
+            if "webm" in content_type:
+                ext = "webm"
+            elif "quicktime" in content_type or url.lower().endswith(".mov"):
+                ext = "mov"
+            return discord.File(io.BytesIO(data), filename=f"profile_video.{ext}")
+    except Exception:
+        logger.exception("Failed to fetch video for attachment")
+    return None
+
+
+async def build_card_files(
     session: aiohttp.ClientSession,
     media: List[dict],
     active_index: int,
@@ -98,16 +128,20 @@ async def build_card_file(
     dating_intent: Optional[str],
     bio: Optional[str],
     cache: Optional[dict] = None,
-) -> discord.File:
-    """Fetches whatever photo bytes are needed and renders the full image
-    card, returning a ready-to-send discord.File. `cache` (keyed by media
-    index) lets a single card session — e.g. flipping through media on the
-    same discovery card — avoid re-downloading images it already has."""
+) -> List[discord.File]:
+    """Fetches whatever bytes are needed and renders the full image card,
+    returning a ready-to-send list of discord.File — the card image, plus
+    the actual video file when the active slide is a video (so Discord's
+    native player can actually play it, which a static PNG never could).
+    `cache` (keyed by media index) lets a single card session — e.g.
+    flipping through media on the same discovery card — avoid re-downloading
+    images it already has."""
     thumbnails: List[Tuple[Optional[bytes], bool]] = []
     for i, item in enumerate((media or [])[:5]):
         is_vid = item.get("is_video", False)
         if is_vid:
-            # No frame extraction — videos render as a placeholder + play icon.
+            # No frame extraction — videos render as a placeholder + play icon
+            # in the card itself; the actual playable file is attached separately.
             thumbnails.append((None, True))
             continue
         if cache is not None and i in cache:
@@ -120,11 +154,14 @@ async def build_card_file(
 
     main_bytes = None
     is_video_active = False
+    video_file = None
     if media and 0 <= active_index < len(media):
         active_item = media[active_index]
         is_video_active = active_item.get("is_video", False)
         if not is_video_active and active_index < len(thumbnails):
             main_bytes = thumbnails[active_index][0]
+        elif is_video_active:
+            video_file = await fetch_video_file(session, active_item["url"])
 
     loop = asyncio.get_event_loop()
     png_bytes = await loop.run_in_executor(
@@ -147,7 +184,10 @@ async def build_card_file(
             bio=bio,
         )
     )
-    return discord.File(io.BytesIO(png_bytes), filename="profile_card.png")
+    files = [discord.File(io.BytesIO(png_bytes), filename="profile_card.png")]
+    if video_file:
+        files.append(video_file)
+    return files
 
 
 async def safe_respond(interaction: discord.Interaction, /, *, content=None, embed=None, view=None, ephemeral=True, **kwargs):
@@ -820,8 +860,8 @@ class DiscoveryCardView(discord.ui.View):
         self.cog = cog
         self._media_cache: dict = {}  # avoids re-downloading unchanged thumbnails while flipping
 
-    async def _render_file(self, guild: discord.Guild) -> discord.File:
-        return await self.cog.build_discovery_card_file(self.candidate, self.media_index, guild, cache=self._media_cache)
+    async def _render_files(self, guild: discord.Guild) -> List[discord.File]:
+        return await self.cog.build_discovery_card_files(self.candidate, self.media_index, guild, cache=self._media_cache)
 
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
     async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -831,8 +871,8 @@ class DiscoveryCardView(discord.ui.View):
             return
         self.media_index = (self.media_index - 1) % len(media)
         await interaction.response.defer()
-        file = await self._render_file(interaction.guild)
-        await interaction.edit_original_response(attachments=[file], view=self)
+        files = await self._render_files(interaction.guild)
+        await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -842,8 +882,8 @@ class DiscoveryCardView(discord.ui.View):
             return
         self.media_index = (self.media_index + 1) % len(media)
         await interaction.response.defer()
-        file = await self._render_file(interaction.guild)
-        await interaction.edit_original_response(attachments=[file], view=self)
+        files = await self._render_files(interaction.guild)
+        await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -918,6 +958,7 @@ class DiscoveryCardView(discord.ui.View):
 
     @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id="discovery:info")
     async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         await self.cog.show_user_profile(interaction, self.candidate["user_id"])
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
@@ -954,8 +995,8 @@ class ProfileMediaView(discord.ui.View):
         if len(self.media) <= 1:
             self.clear_items()
 
-    async def render_file(self) -> discord.File:
-        return await build_card_file(
+    async def render_files(self) -> List[discord.File]:
+        return await build_card_files(
             self.cog._http_session, self.media, self.index,
             display_name=self.display_name, age_group=self.age_group, location=self.location,
             is_verified=self.is_verified, tier_text=self.tier_text, gender=self.gender,
@@ -975,8 +1016,8 @@ class ProfileMediaView(discord.ui.View):
             return
         self.index = (self.index - 1) % len(self.media)
         await interaction.response.defer()
-        file = await self.render_file()
-        await interaction.edit_original_response(attachments=[file], view=self)
+        files = await self.render_files()
+        await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -984,8 +1025,8 @@ class ProfileMediaView(discord.ui.View):
             return
         self.index = (self.index + 1) % len(self.media)
         await interaction.response.defer()
-        file = await self.render_file()
-        await interaction.edit_original_response(attachments=[file], view=self)
+        files = await self.render_files()
+        await interaction.edit_original_response(attachments=files, view=self)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in ProfileMediaView item %r", item)
@@ -1434,13 +1475,13 @@ class DatingCog(commands.Cog):
 
         return None
 
-    async def build_discovery_card_file(self, candidate: dict, media_index: int, guild: discord.Guild, cache: dict = None) -> discord.File:
+    async def build_discovery_card_files(self, candidate: dict, media_index: int, guild: discord.Guild, cache: dict = None) -> List[discord.File]:
         member = guild.get_member(candidate["user_id"]) if guild else None
         display_name = member.display_name if member else f"Member {str(candidate['user_id'])[-4:]}"
         is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
         tier_text = f"{candidate['tier']} · {candidate['average_score']}/10" if candidate.get('average_score') else candidate.get('tier')
 
-        return await build_card_file(
+        return await build_card_files(
             self._http_session,
             candidate.get("media", []),
             media_index,
@@ -1550,7 +1591,7 @@ class DatingCog(commands.Cog):
             return
 
         view = DiscoveryCardView(candidate, 0, self)
-        file = await self.build_discovery_card_file(candidate, 0, interaction.guild, cache=view._media_cache)
+        files = await self.build_discovery_card_files(candidate, 0, interaction.guild, cache=view._media_cache)
 
         media = candidate.get('media', [])
         max_media = min(5, len(media))
@@ -1560,8 +1601,8 @@ class DatingCog(commands.Cog):
             async def jump_callback(interaction2: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
                 viewref.media_index = index
                 await interaction2.response.defer()
-                jump_file = await viewref._render_file(interaction2.guild)
-                await interaction2.edit_original_response(attachments=[jump_file], view=viewref)
+                jump_files = await viewref._render_files(interaction2.guild)
+                await interaction2.edit_original_response(attachments=jump_files, view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1576,11 +1617,11 @@ class DatingCog(commands.Cog):
 
         if edit_message_id:
             try:
-                await interaction.followup.edit_message(edit_message_id, content=None, attachments=[file], view=view)
+                await interaction.followup.edit_message(edit_message_id, content=None, attachments=files, view=view)
                 return
             except Exception:
                 pass
-        await safe_respond(interaction, file=file, view=view, ephemeral=True)
+        await safe_respond(interaction, files=files, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
         candidate = await self.get_next_liked_you_candidate(interaction.user.id)
@@ -1589,8 +1630,8 @@ class DatingCog(commands.Cog):
             return
 
         view = DiscoveryCardView(candidate, 0, self)
-        file = await self.build_discovery_card_file(candidate, 0, interaction.guild, cache=view._media_cache)
-        await safe_respond(interaction, content="🤩 **This person liked your profile!**", file=file, view=view, ephemeral=True)
+        files = await self.build_discovery_card_files(candidate, 0, interaction.guild, cache=view._media_cache)
+        await safe_respond(interaction, content="🤩 **This person liked your profile!**", files=files, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
         if interaction.user.id != target_id:
@@ -1646,9 +1687,9 @@ class DatingCog(commands.Cog):
         ) if media else None
 
         if view:
-            file = await view.render_file()
+            files = await view.render_files()
         else:
-            file = await build_card_file(
+            files = await build_card_files(
                 self._http_session, [], 0,
                 display_name=display_name, age_group=row[0], location=row[2],
                 is_verified=is_verified, tier_text=tier_str, gender=row[1],
@@ -1656,10 +1697,11 @@ class DatingCog(commands.Cog):
                 dating_intent=row[5], bio=row[3],
             )
 
-        await safe_respond(interaction, file=file, view=view, ephemeral=True)
+        await safe_respond(interaction, files=files, view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     async def view_profile_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
+        await interaction.response.defer(ephemeral=True)
         target = member or interaction.user
         await self.show_user_profile(interaction, target.id)
 
@@ -1705,9 +1747,9 @@ class DatingCog(commands.Cog):
             ) if media else None
 
             if view:
-                file = await view.render_file()
+                files = await view.render_files()
             else:
-                file = await build_card_file(
+                files = await build_card_files(
                     self._http_session, [], 0,
                     display_name=interaction.user.display_name, age_group=row[0], location=row[2],
                     is_verified=is_verified, tier_text=tier_str, gender=row[1],
@@ -1718,7 +1760,7 @@ class DatingCog(commands.Cog):
             await safe_respond(
                 interaction,
                 content="📝 **PUBLIC PROFILE REVIEW** — community members can leave feedback below!",
-                file=file, view=view, ephemeral=False
+                files=files, view=view, ephemeral=False
             )
         except Exception:
             logger.exception("Error in /profile-check")
