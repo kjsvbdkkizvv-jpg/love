@@ -2,32 +2,38 @@
 card_renderer.py — generates a styled profile card image (PNG bytes) to
 replace the old text-embed profile display.
 
-Renders at 2x internal resolution then downsamples for crisp text/edges.
-Fonts are bundled in fonts/ next to this file so rendering quality never
-depends on what happens to be installed in the deployment container.
+Memory-safety notes (this file previously caused OOM crashes in production):
+- Photos are decoded via PIL's draft() mode, which uses JPEG's built-in
+  DCT downscaling to avoid ever materializing a full-resolution decode of
+  a user's original camera photo (which can be 30-40MB+ per image).
+- No supersampling: text legibility comes from the bundled font, not from
+  rendering at 2x/4x resolution and downsampling, which multiplied peak
+  memory use for comparatively little visual benefit.
+- Gradients are built via cheap resize operations only — no large rotated
+  intermediates.
+- Fonts are bundled in fonts/ next to this file so rendering quality never
+  depends on what happens to be installed in the deployment container.
 """
 from __future__ import annotations
 import io
-import math
 import os
 from typing import List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageChops, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageChops
 
-SCALE = 2  # internal supersampling factor for crisp text/gradients
+CARD_W = 640
+CARD_H = 900
+PHOTO_H = 560
+FILMSTRIP_H = 88
+CORNER_RADIUS = 28
+BORDER_WIDTH = 8
 
-CARD_W = 640 * SCALE
-CARD_H = 900 * SCALE
-PHOTO_H = 560 * SCALE
-FILMSTRIP_H = 92 * SCALE
-CORNER_RADIUS = 30 * SCALE
-BORDER_WIDTH = 10 * SCALE
+MAX_DECODE_DIM = 1600
 
 BG_COLOR = (16, 12, 20)
 PANEL_COLOR = (24, 17, 29)
 TEXT_WHITE = (252, 252, 253)
 TEXT_MUTED = (196, 186, 202)
-SHADOW_COLOR = (0, 0, 0, 160)
 
 GRAD_BORDER = [(255, 61, 138), (191, 60, 220), (110, 90, 255), (61, 160, 255)]
 GRAD_GENDER = [(93, 111, 255), (150, 90, 255)]
@@ -65,8 +71,6 @@ def _load_font(paths, size):
             return ImageFont.truetype(p, size)
         except Exception:
             continue
-    # Last-resort fallback. Pillow >=9.5 supports a size arg here; older
-    # versions ignore it and render tiny — still better than crashing.
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -81,7 +85,16 @@ def _rounded_mask(size, radius):
 
 
 def _fit_cover(img, target_w, target_h):
+    try:
+        img.draft("RGB", (target_w, target_h))
+    except Exception:
+        pass
+
     img = ImageOps.exif_transpose(img).convert("RGB")
+
+    if img.width > MAX_DECODE_DIM or img.height > MAX_DECODE_DIM:
+        img.thumbnail((MAX_DECODE_DIM, MAX_DECODE_DIM), Image.BILINEAR)
+
     src_ratio = img.width / img.height
     tgt_ratio = target_w / target_h
     if src_ratio > tgt_ratio:
@@ -96,23 +109,18 @@ def _fit_cover(img, target_w, target_h):
     return img.crop((left, top, left + target_w, top + target_h))
 
 
-def _make_diagonal_gradient(w, h, colors):
+def _make_gradient(w, h, colors):
     n = len(colors)
-    diag = int(math.hypot(w, h)) + 40
     strip = Image.new("RGB", (n, 1))
     strip.putdata(colors)
-    grad = strip.resize((diag, max(diag // 3, 40)), Image.BILINEAR)
-    grad = grad.resize((diag, diag), Image.BILINEAR)
-    grad = grad.rotate(35, expand=True, resample=Image.BILINEAR)
-    gw, gh = grad.size
-    left = (gw - w) // 2
-    top = (gh - h) // 2
-    return grad.crop((left, top, left + w, top + h))
+    grad = strip.resize((max(w, 2), 1), Image.BILINEAR)
+    grad = grad.resize((max(w, 2), max(h, 2)), Image.BILINEAR)
+    return grad.crop((0, 0, w, h))
 
 
 def _draw_gradient_pill(card, x, y, w, h, colors, radius=None):
     radius = radius if radius is not None else h // 2
-    grad = _make_diagonal_gradient(w, h, colors)
+    grad = _make_gradient(w, h, colors)
     mask = _rounded_mask((w, h), radius)
     card.paste(grad, (x, y), mask)
 
@@ -123,15 +131,8 @@ def _draw_gradient_ring(card, x, y, size, colors, thickness):
     idraw = ImageDraw.Draw(inner)
     idraw.ellipse([thickness, thickness, size - thickness, size - thickness], fill=255)
     ring = ImageChops.subtract(outer_mask, inner)
-    grad = _make_diagonal_gradient(size, size, colors)
+    grad = _make_gradient(size, size, colors)
     card.paste(grad, (x, y), ring)
-
-
-def _text_with_shadow(draw, xy, text, font, fill, shadow_offset=2):
-    x, y = xy
-    so = shadow_offset * SCALE
-    draw.text((x + so, y + so), text, font=font, fill=(0, 0, 0, 140))
-    draw.text((x, y), text, font=font, fill=fill)
 
 
 def _draw_pin_icon(draw, x, y, size, color):
@@ -142,7 +143,6 @@ def _draw_pin_icon(draw, x, y, size, color):
 
 
 def _draw_gender_icon(draw, cx, cy, size, kind, color=(255, 255, 255)):
-    """Hand-drawn gender glyphs — no reliance on font glyph coverage."""
     r = size * 0.32
     lw = max(2, int(size * 0.12))
     if kind == "woman":
@@ -178,6 +178,12 @@ def _draw_crown_icon(draw, x, y, w, h, color=(255, 255, 255)):
         draw.ellipse([cx - h * 0.09, y - h * 0.09, cx + h * 0.09, y + h * 0.09], fill=color)
 
 
+def _text_with_shadow(draw, xy, text, font, fill, shadow_offset=2):
+    x, y = xy
+    draw.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=fill)
+
+
 def _text_wrap(draw, text, font, max_width):
     words = text.split()
     lines = []
@@ -196,7 +202,7 @@ def _text_wrap(draw, text, font, max_width):
 
 
 def _draw_gradient_chip(card, draw, x, y, text, font, colors, icon_fn=None,
-                         fg=(255, 255, 255), pad_x=18, pad_y=10, icon_w=0):
+                         fg=(255, 255, 255), pad_x=16, pad_y=9, icon_w=0):
     text_w = draw.textlength(text, font=font)
     h = font.size + pad_y * 2 - 4
     w = int(text_w) + pad_x * 2 + icon_w
@@ -204,7 +210,7 @@ def _draw_gradient_chip(card, draw, x, y, text, font, colors, icon_fn=None,
     if icon_fn:
         icon_fn(draw, x + pad_x + icon_w // 2, y + h // 2, icon_w * 0.9)
     draw.text((x + pad_x + icon_w, y + pad_y - 2), text, font=font, fill=fg)
-    return x + w + 12 * SCALE
+    return x + w + 10
 
 
 def render_profile_card(
@@ -226,44 +232,34 @@ def render_profile_card(
 ):
     card = Image.new("RGB", (CARD_W, CARD_H), BG_COLOR)
 
-    font_name = _load_font(FONT_BOLD_CANDIDATES, 46 * SCALE)
-    font_sub = _load_font(FONT_MEDIUM_CANDIDATES, 25 * SCALE)
-    font_chip = _load_font(FONT_SEMIBOLD_CANDIDATES, 21 * SCALE)
-    font_small = _load_font(FONT_REGULAR_CANDIDATES, 21 * SCALE)
-    font_section = _load_font(FONT_SEMIBOLD_CANDIDATES, 23 * SCALE)
+    font_name = _load_font(FONT_BOLD_CANDIDATES, 38)
+    font_sub = _load_font(FONT_MEDIUM_CANDIDATES, 21)
+    font_chip = _load_font(FONT_SEMIBOLD_CANDIDATES, 18)
+    font_small = _load_font(FONT_REGULAR_CANDIDATES, 18)
+    font_section = _load_font(FONT_SEMIBOLD_CANDIDATES, 20)
 
-    # ---- Photo / video-placeholder zone ----
     if is_video:
-        # Actual video playback happens via a separate native video
-        # attachment sent alongside this image (Discord can't play video
-        # inside a PNG) — this zone is just a clear visual cue to look below.
-        base = _make_diagonal_gradient(CARD_W, PHOTO_H, [(70, 30, 90), (30, 20, 60)])
+        base = _make_gradient(CARD_W, PHOTO_H, [(70, 30, 90), (30, 20, 60)])
         card.paste(base, (0, 0))
         draw = ImageDraw.Draw(card)
-        r = 60 * SCALE
+        r = 50
         cx, cy = CARD_W // 2, int(PHOTO_H * 0.42)
         _draw_gradient_pill(card, cx - r, cy - r, r * 2, r * 2, GRAD_ACTIVE_THUMB, radius=r)
-        draw.polygon([
-            (cx - int(16 * SCALE), cy - int(26 * SCALE)),
-            (cx - int(16 * SCALE), cy + int(26 * SCALE)),
-            (cx + int(24 * SCALE), cy)
-        ], fill=(255, 255, 255))
-        note_font = _load_font(FONT_SEMIBOLD_CANDIDATES, 22 * SCALE)
+        draw.polygon([(cx - 13, cy - 22), (cx - 13, cy + 22), (cx + 20, cy)], fill=(255, 255, 255))
+        note_font = font_section
         note = "Video attached below"
         nw = draw.textlength(note, font=note_font)
-        note_y = cy + r + int(24 * SCALE)
+        note_y = cy + r + 20
         draw.text((CARD_W // 2 - nw / 2, note_y), note, font=note_font, fill=TEXT_WHITE)
         arrow_cx = CARD_W // 2
-        arrow_y = note_y + note_font.size + int(10 * SCALE)
-        aw, ah = int(14 * SCALE), int(10 * SCALE)
-        draw.polygon([
-            (arrow_cx - aw, arrow_y), (arrow_cx + aw, arrow_y), (arrow_cx, arrow_y + ah)
-        ], fill=TEXT_WHITE)
+        arrow_y = note_y + note_font.size + 8
+        draw.polygon([(arrow_cx - 12, arrow_y), (arrow_cx + 12, arrow_y), (arrow_cx, arrow_y + 8)], fill=TEXT_WHITE)
     elif main_image_bytes:
         try:
-            photo = Image.open(io.BytesIO(main_image_bytes))
-            photo = _fit_cover(photo, CARD_W, PHOTO_H)
+            with Image.open(io.BytesIO(main_image_bytes)) as opened:
+                photo = _fit_cover(opened, CARD_W, PHOTO_H)
             card.paste(photo, (0, 0))
+            del photo
         except Exception:
             card.paste(Image.new("RGB", (CARD_W, PHOTO_H), (48, 36, 56)), (0, 0))
         draw = ImageDraw.Draw(card)
@@ -271,8 +267,7 @@ def render_profile_card(
         card.paste(Image.new("RGB", (CARD_W, PHOTO_H), (48, 36, 56)), (0, 0))
         draw = ImageDraw.Draw(card)
 
-    # bottom gradient wash for text legibility, tinted warm purple/magenta
-    grad_h = int(300 * SCALE)
+    grad_h = 260
     gradient = Image.new("RGBA", (CARD_W, grad_h), (0, 0, 0, 0))
     gdraw = ImageDraw.Draw(gradient)
     for i in range(grad_h):
@@ -285,12 +280,13 @@ def render_profile_card(
     card_rgba = card.convert("RGBA")
     card_rgba.alpha_composite(gradient, (0, PHOTO_H - grad_h))
     card = card_rgba.convert("RGB")
+    del card_rgba, gradient
     draw = ImageDraw.Draw(card)
 
-    pad = 22 * SCALE
+    pad = 20
 
     if is_verified:
-        badge_r = 30 * SCALE
+        badge_r = 26
         vx, vy = CARD_W - pad - badge_r * 2, pad
         _draw_gradient_pill(card, vx, vy, badge_r * 2, badge_r * 2, GRAD_VERIFIED, radius=badge_r)
         cx, cy = vx + badge_r, vy + badge_r
@@ -300,117 +296,110 @@ def render_profile_card(
         )
 
     if tier_text:
-        icon_w = int(34 * SCALE)
+        icon_w = 28
         _draw_gradient_chip(card, draw, pad, pad, tier_text, font_chip, GRAD_TIER, icon_w=icon_w, fg=(48, 24, 4))
-        _draw_crown_icon(draw, pad + 10 * SCALE, pad + 12 * SCALE, icon_w - 14 * SCALE, (font_chip.size - 12 * SCALE), color=(120, 55, 0))
+        _draw_crown_icon(draw, pad + 8, pad + 10, icon_w - 12, font_chip.size - 10, color=(120, 55, 0))
 
     total_media = len(thumbnails) if thumbnails else 0
     if total_media:
         counter_text = f"{active_index + 1}/{total_media}"
         tw = draw.textlength(counter_text, font=font_small)
-        cx0 = CARD_W - tw - pad - 14 * SCALE
-        cy0 = PHOTO_H - 46 * SCALE
-        draw.rounded_rectangle(
-            [cx0 - 12 * SCALE, cy0 - 6 * SCALE, cx0 + tw + 12 * SCALE, cy0 + 32 * SCALE],
-            radius=15 * SCALE, fill=(0, 0, 0)
-        )
+        cx0 = CARD_W - tw - pad - 12
+        cy0 = PHOTO_H - 40
+        draw.rounded_rectangle([cx0 - 10, cy0 - 5, cx0 + tw + 10, cy0 + 28], radius=13, fill=(0, 0, 0))
         draw.text((cx0, cy0), counter_text, font=font_small, fill=TEXT_WHITE)
 
     name_line = display_name if not age_group else f"{display_name}, {age_group}"
-    _text_with_shadow(draw, (pad, PHOTO_H - 98 * SCALE), name_line, font_name, TEXT_WHITE)
+    _text_with_shadow(draw, (pad, PHOTO_H - 86), name_line, font_name, TEXT_WHITE)
 
     if location:
-        _draw_pin_icon(draw, pad + 12 * SCALE, PHOTO_H - 32 * SCALE, 15 * SCALE, (255, 140, 195))
-        _text_with_shadow(draw, (pad + 28 * SCALE, PHOTO_H - 44 * SCALE), location, font_sub, TEXT_MUTED, shadow_offset=1)
+        _draw_pin_icon(draw, pad + 10, PHOTO_H - 28, 13, (255, 140, 195))
+        _text_with_shadow(draw, (pad + 24, PHOTO_H - 38), location, font_sub, TEXT_MUTED, shadow_offset=1)
 
-    # ---- Filmstrip ----
-    strip_y = PHOTO_H + 12 * SCALE
-    thumb_size = FILMSTRIP_H - 24 * SCALE
+    strip_y = PHOTO_H + 10
+    thumb_size = FILMSTRIP_H - 22
     x_cursor = pad
-    for i, (thumb_bytes, thumb_is_video) in enumerate(thumbnails[:5]):
+    for i, (thumb_bytes, thumb_is_video) in enumerate((thumbnails or [])[:5]):
         try:
             if thumb_bytes:
-                t_img = Image.open(io.BytesIO(thumb_bytes))
-                t_img = _fit_cover(t_img, thumb_size, thumb_size)
+                with Image.open(io.BytesIO(thumb_bytes)) as opened:
+                    t_img = _fit_cover(opened, thumb_size, thumb_size)
             else:
                 t_img = Image.new("RGB", (thumb_size, thumb_size), (48, 36, 56))
         except Exception:
             t_img = Image.new("RGB", (thumb_size, thumb_size), (48, 36, 56))
 
         if i == active_index:
-            ring_pad = 5 * SCALE
+            ring_pad = 4
             _draw_gradient_ring(
                 card, x_cursor - ring_pad, strip_y - ring_pad,
-                thumb_size + ring_pad * 2, GRAD_ACTIVE_THUMB, thickness=int(3.5 * SCALE)
+                thumb_size + ring_pad * 2, GRAD_ACTIVE_THUMB, thickness=3
             )
 
-        mask = _rounded_mask((thumb_size, thumb_size), 11 * SCALE)
+        mask = _rounded_mask((thumb_size, thumb_size), 10)
         card.paste(t_img, (x_cursor, strip_y), mask)
+        del t_img
         draw = ImageDraw.Draw(card)
 
         if i != active_index:
             draw.rounded_rectangle(
                 [x_cursor, strip_y, x_cursor + thumb_size, strip_y + thumb_size],
-                radius=11 * SCALE, outline=(85, 74, 95), width=int(1.5 * SCALE)
+                radius=10, outline=(85, 74, 95), width=1
             )
 
         if thumb_is_video:
             pr = thumb_size * 0.16
             pcx, pcy = x_cursor + thumb_size // 2, strip_y + thumb_size // 2
-            draw.ellipse([pcx - pr * 1.4, pcy - pr * 1.4, pcx + pr * 1.4, pcy + pr * 1.4], fill=(0, 0, 0, 150))
-            draw.polygon([
-                (pcx - pr * 0.6, pcy - pr), (pcx - pr * 0.6, pcy + pr), (pcx + pr * 1.1, pcy)
-            ], fill=(255, 255, 255))
-        x_cursor += thumb_size + 14 * SCALE
+            draw.ellipse([pcx - pr * 1.4, pcy - pr * 1.4, pcx + pr * 1.4, pcy + pr * 1.4], fill=(0, 0, 0))
+            draw.polygon([(pcx - pr * 0.6, pcy - pr), (pcx - pr * 0.6, pcy + pr), (pcx + pr * 1.1, pcy)], fill=(255, 255, 255))
+        x_cursor += thumb_size + 12
 
-    # ---- Info panel ----
     panel_y = PHOTO_H + FILMSTRIP_H
     draw.rectangle([0, panel_y, CARD_W, CARD_H], fill=PANEL_COLOR)
-    # subtle top highlight line for separation/pop
-    draw.rectangle([0, panel_y, CARD_W, panel_y + int(2 * SCALE)], fill=(70, 50, 90))
+    draw.rectangle([0, panel_y, CARD_W, panel_y + 2], fill=(70, 50, 90))
 
-    y = panel_y + 22 * SCALE
+    y = panel_y + 20
     x = pad
 
     x2 = x
     if gender:
-        icon_w = int(30 * SCALE)
+        icon_w = 26
         kind = "man" if gender.lower() == "man" else ("woman" if gender.lower() == "woman" else "other")
         x2 = _draw_gradient_chip(
             card, draw, x, y, gender, font_chip, GRAD_GENDER, icon_w=icon_w,
             icon_fn=lambda d, cx, cy, s, k=kind: _draw_gender_icon(d, cx, cy, s, k)
         )
     if interested_in:
-        icon_w = int(30 * SCALE)
+        icon_w = 26
         _draw_gradient_chip(
             card, draw, x2, y, f"Into {interested_in}", font_chip, GRAD_INTERESTED, icon_w=icon_w,
             icon_fn=lambda d, cx, cy, s: _draw_heart_icon(d, cx, cy, s)
         )
-    y += 52 * SCALE
+    y += 46
 
     if interests:
         cx = x
         cy = y
         max_x = CARD_W - pad
         for tag in interests[:8]:
-            tag_w = draw.textlength(tag, font=font_chip) + 34 * SCALE
+            tag_w = draw.textlength(tag, font=font_chip) + 30
             if cx + tag_w > max_x:
                 cx = x
-                cy += 48 * SCALE
+                cy += 44
             cx = _draw_gradient_chip(card, draw, cx, cy, tag, font_chip, GRAD_INTEREST_TAG)
-        y = cy + 52 * SCALE
+        y = cy + 46
     else:
-        y += 8 * SCALE
+        y += 8
 
     if dating_intent:
         draw.text((x, y), "Looking for", font=font_small, fill=TEXT_MUTED)
-        y += 26 * SCALE
+        y += 24
         draw.text((x, y), dating_intent, font=font_section, fill=TEXT_WHITE)
-        y += 42 * SCALE
+        y += 38
 
     if bio:
-        max_bio_h = CARD_H - y - 20 * SCALE
-        line_h = 27 * SCALE
+        max_bio_h = CARD_H - y - 18
+        line_h = 24
         max_lines = max(1, int(max_bio_h // line_h))
         lines = _text_wrap(draw, bio, font_small, CARD_W - pad * 2)
         if len(lines) > max_lines:
@@ -424,21 +413,20 @@ def render_profile_card(
             draw.text((x, y), line, font=font_small, fill=TEXT_MUTED)
             y += line_h
 
-    # ---- Rounded content + glowing gradient border frame ----
     content_mask = _rounded_mask((CARD_W, CARD_H), CORNER_RADIUS)
     content = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
     content.paste(card, (0, 0), content_mask)
+    del card, content_mask
 
     outer_w, outer_h = CARD_W + BORDER_WIDTH * 2, CARD_H + BORDER_WIDTH * 2
     outer_mask = _rounded_mask((outer_w, outer_h), CORNER_RADIUS + BORDER_WIDTH)
-    border_grad = _make_diagonal_gradient(outer_w, outer_h, GRAD_BORDER)
+    border_grad = _make_gradient(outer_w, outer_h, GRAD_BORDER)
     final = Image.new("RGBA", (outer_w, outer_h), (0, 0, 0, 0))
     final.paste(border_grad, (0, 0), outer_mask)
     final.paste(content, (BORDER_WIDTH, BORDER_WIDTH), content)
-
-    # Downsample from 2x supersampled render for crisp anti-aliased result
-    final = final.resize((outer_w // SCALE, outer_h // SCALE), Image.LANCZOS)
+    del outer_mask, border_grad, content
 
     buf = io.BytesIO()
-    final.save(buf, format="PNG")
+    final.save(buf, format="PNG", optimize=False)
+    del final
     return buf.getvalue()
