@@ -9,6 +9,7 @@ import datetime
 import logging
 import io
 import functools
+import concurrent.futures
 from typing import List, Optional, Tuple
 
 import aiohttp
@@ -70,13 +71,19 @@ async def resolve_profile_media(bot: commands.Bot, media_items) -> List[dict]:
     return resolved
 
 
+MAX_PHOTO_FETCH_BYTES = 20 * 1024 * 1024  # defensive cap; draft() decoding handles normal photos fine regardless
+
+
 async def fetch_media_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     """Downloads raw image bytes for card rendering. Returns None on any
     failure — the renderer already draws a graceful placeholder box."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200:
-                return await resp.read()
+            if resp.status != 200:
+                return None
+            if resp.content_length and resp.content_length > MAX_PHOTO_FETCH_BYTES:
+                return None
+            return await resp.read()
     except Exception:
         logger.exception("Failed to fetch media bytes for card rendering")
     return None
@@ -128,6 +135,7 @@ async def build_card_files(
     dating_intent: Optional[str],
     bio: Optional[str],
     cache: Optional[dict] = None,
+    executor: Optional[concurrent.futures.Executor] = None,
 ) -> List[discord.File]:
     """Fetches whatever bytes are needed and renders the full image card,
     returning a ready-to-send list of discord.File — the card image, plus
@@ -135,7 +143,10 @@ async def build_card_files(
     native player can actually play it, which a static PNG never could).
     `cache` (keyed by media index) lets a single card session — e.g.
     flipping through media on the same discovery card — avoid re-downloading
-    images it already has."""
+    images it already has. `executor` should be a small, dedicated
+    ThreadPoolExecutor (rather than the default shared one) so concurrent
+    renders from multiple users can't all pile up in parallel and spike
+    memory at once."""
     thumbnails: List[Tuple[Optional[bytes], bool]] = []
     for i, item in enumerate((media or [])[:5]):
         is_vid = item.get("is_video", False)
@@ -165,7 +176,7 @@ async def build_card_files(
 
     loop = asyncio.get_event_loop()
     png_bytes = await loop.run_in_executor(
-        None,
+        executor,
         functools.partial(
             render_profile_card,
             main_image_bytes=main_bytes,
@@ -1001,7 +1012,8 @@ class ProfileMediaView(discord.ui.View):
             display_name=self.display_name, age_group=self.age_group, location=self.location,
             is_verified=self.is_verified, tier_text=self.tier_text, gender=self.gender,
             interested_in=self.interested_in, interests=self.interests or [],
-            dating_intent=self.dating_intent, bio=self.bio, cache=self._cache
+            dating_intent=self.dating_intent, bio=self.bio, cache=self._cache,
+            executor=self.cog._render_executor,
         )
 
     async def _check_owner(self, interaction: discord.Interaction) -> bool:
@@ -1062,6 +1074,14 @@ class DatingCog(commands.Cog):
         self._photo_ticket_monitors = {}  # ticket_id -> task
         self._confirming_tickets = set()  # in-memory spam-click guard
         self._http_session: Optional[aiohttp.ClientSession] = None
+        # Dedicated, small executor for card rendering. Using the default
+        # (shared, up to ~32 threads) executor let several users' image
+        # renders run fully concurrently, each holding its own set of
+        # decoded images — a major contributor to the OOM crash under any
+        # real load. Capping this to 2 keeps peak memory bounded regardless
+        # of how many people are swiping at once (renders queue briefly
+        # instead of piling up in parallel).
+        self._render_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="card-render")
 
     async def cog_load(self):
         self.voice_cleanup_task.start()
@@ -1086,6 +1106,7 @@ class DatingCog(commands.Cog):
             t.cancel()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
+        self._render_executor.shutdown(wait=False)
 
     @tasks.loop(minutes=1)
     async def voice_cleanup_task(self):
@@ -1496,6 +1517,7 @@ class DatingCog(commands.Cog):
             dating_intent=candidate.get('dating_intent'),
             bio=candidate.get('bio'),
             cache=cache,
+            executor=self._render_executor,
         )
 
     async def record_like(self, liker_id: int, target_id: int) -> bool:
@@ -1695,6 +1717,7 @@ class DatingCog(commands.Cog):
                 is_verified=is_verified, tier_text=tier_str, gender=row[1],
                 interested_in=row[10], interests=interests_list,
                 dating_intent=row[5], bio=row[3],
+                executor=self._render_executor,
             )
 
         await safe_respond(interaction, files=files, view=view, ephemeral=True)
@@ -1755,6 +1778,7 @@ class DatingCog(commands.Cog):
                     is_verified=is_verified, tier_text=tier_str, gender=row[1],
                     interested_in=row[9], interests=interests_list,
                     dating_intent=row[5], bio=row[3],
+                    executor=self._render_executor,
                 )
 
             await safe_respond(
