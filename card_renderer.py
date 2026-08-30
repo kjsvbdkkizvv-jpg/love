@@ -217,6 +217,7 @@ def render_profile_card(
     *,
     main_image_bytes,
     is_video,
+    video_available=True,
     thumbnails,
     active_index,
     display_name,
@@ -247,13 +248,19 @@ def render_profile_card(
         _draw_gradient_pill(card, cx - r, cy - r, r * 2, r * 2, GRAD_ACTIVE_THUMB, radius=r)
         draw.polygon([(cx - 13, cy - 22), (cx - 13, cy + 22), (cx + 20, cy)], fill=(255, 255, 255))
         note_font = font_section
-        note = "Video attached below"
+        note = "Video attached below" if video_available else "Video couldn't load in time"
         nw = draw.textlength(note, font=note_font)
         note_y = cy + r + 20
         draw.text((CARD_W // 2 - nw / 2, note_y), note, font=note_font, fill=TEXT_WHITE)
-        arrow_cx = CARD_W // 2
-        arrow_y = note_y + note_font.size + 8
-        draw.polygon([(arrow_cx - 12, arrow_y), (arrow_cx + 12, arrow_y), (arrow_cx, arrow_y + 8)], fill=TEXT_WHITE)
+        if video_available:
+            arrow_cx = CARD_W // 2
+            arrow_y = note_y + note_font.size + 8
+            draw.polygon([(arrow_cx - 12, arrow_y), (arrow_cx + 12, arrow_y), (arrow_cx, arrow_y + 8)], fill=TEXT_WHITE)
+        else:
+            retry_font = font_small
+            retry = "Try navigating back to this slide again"
+            rw = draw.textlength(retry, font=retry_font)
+            draw.text((CARD_W // 2 - rw / 2, note_y + note_font.size + 10), retry, font=retry_font, fill=TEXT_MUTED)
     elif main_image_bytes:
         try:
             with Image.open(io.BytesIO(main_image_bytes)) as opened:
