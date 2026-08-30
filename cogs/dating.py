@@ -1123,12 +1123,6 @@ class DiscoveryCardView(discord.ui.View):
         )
         await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
-    @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id="discovery:info")
-    @button_cooldown(3.0, key="view_profile_render")
-    async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        await self.cog.show_user_profile(interaction, self.candidate["user_id"])
-
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Unhandled error in DiscoveryCardView item %r", item)
         await safe_respond(interaction, content="⚠️ Something went wrong processing that action. Please try again.", ephemeral=True)
@@ -1232,6 +1226,7 @@ class DatingCog(commands.Cog):
         self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
         self._photo_ticket_monitors = {}  # ticket_id -> task
         self._confirming_tickets = set()  # in-memory spam-click guard
+        self._last_served_candidate: dict = {}  # user_id -> candidate_user_id, prevents immediate repeats
         self._http_session: Optional[aiohttp.ClientSession] = None
         # Dedicated, small executor for card rendering. Using the default
         # (shared, up to ~32 threads) executor let several users' image
@@ -1513,7 +1508,7 @@ class DatingCog(commands.Cog):
             new_msg = await ch.send("When you are ready, press Confirm Media below.", view=PhotoConfirmView(self, ticket_id, owner_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS))
             self._photo_ticket_confirm_msgs[ch.id] = new_msg.id
 
-    async def get_weighted_candidate(self, user_id: int):
+    async def get_weighted_candidate(self, user_id: int, exclude_id: Optional[int] = None):
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 SELECT u.dating_pool, u.gender, u.age_group, u.location, r.tier, u.interested_in
@@ -1555,7 +1550,14 @@ class DatingCog(commands.Cog):
                       FROM matches WHERE status = 'ACTIVE'
                   )
             """
-            async with db.execute(query, (user_id, user_id, user_pool, user_id, user_id, user_id)) as cursor:
+            params = (user_id, user_id, user_pool, user_id, user_id, user_id)
+            if exclude_id is not None:
+                # Belt-and-suspenders: guarantees the exact person just acted
+                # on (liked/passed/blocked) can never be the very next card
+                # shown, independent of anything else in the pool/query.
+                query += " AND u.user_id != ?"
+                params = params + (exclude_id,)
+            async with db.execute(query, params) as cursor:
                 candidates = await cursor.fetchall()
 
         if not candidates:
@@ -1758,7 +1760,8 @@ class DatingCog(commands.Cog):
             await safe_respond(interaction, content=content, ephemeral=True)
             return
 
-        candidate = await self.get_weighted_candidate(interaction.user.id)
+        last_shown_id = self._last_served_candidate.get(interaction.user.id)
+        candidate = await self.get_weighted_candidate(interaction.user.id, exclude_id=last_shown_id)
         if not candidate:
             content = "🎉 You have viewed all available candidate profiles in your pool for now!"
             if edit_message_id:
@@ -1770,6 +1773,7 @@ class DatingCog(commands.Cog):
             await safe_respond(interaction, content=content, ephemeral=True)
             return
 
+        self._last_served_candidate[interaction.user.id] = candidate["user_id"]
         view = DiscoveryCardView(candidate, 0, self)
         files = await self.build_discovery_card_files(candidate, 0, interaction.guild, cache=view._media_cache)
 
