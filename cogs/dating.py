@@ -6,6 +6,7 @@ import asyncio
 import random
 import json
 import datetime
+import time
 import logging
 import io
 import functools
@@ -29,6 +30,66 @@ MAX_INTERESTS = 5
 INTEREST_TO_GENDER = {"Men": "Man", "Women": "Woman"}
 
 
+class _CooldownManager:
+    """Lightweight in-memory per-user, per-action cooldown tracker. This is
+    what actually stops spam-clicking from piling up concurrent work (image
+    renders, DB writes, Discord API calls) regardless of how fast any single
+    action is — cheap in-process check, no DB round-trip needed."""
+
+    def __init__(self):
+        self._last_use: dict = {}
+        self._last_cleanup = time.monotonic()
+
+    def remaining(self, user_id: int, key: str, seconds: float) -> float:
+        now = time.monotonic()
+        last = self._last_use.get((user_id, key))
+        if last is not None:
+            elapsed = now - last
+            if elapsed < seconds:
+                return seconds - elapsed
+        self._last_use[(user_id, key)] = now
+        # Periodic sweep so this dict doesn't grow unbounded over a
+        # long-running process — cheap, and only runs occasionally.
+        if now - self._last_cleanup > 600:
+            cutoff = now - 600
+            self._last_use = {k: v for k, v in self._last_use.items() if v > cutoff}
+            self._last_cleanup = now
+        return 0.0
+
+
+cooldowns = _CooldownManager()
+
+
+def button_cooldown(seconds: float, key: Optional[str] = None):
+    """Decorator for discord.ui.Button/Select callbacks: rejects a repeat
+    click from the same user within `seconds` with a short, friendly
+    message instead of letting it queue more work. Place this directly
+    above the method body, below @discord.ui.button(...)."""
+    def decorator(func):
+        cd_key = key or func.__qualname__
+
+        @functools.wraps(func)
+        async def wrapper(self, interaction: discord.Interaction, *args, **kwargs):
+            wait = cooldowns.remaining(interaction.user.id, cd_key, seconds)
+            if wait > 0:
+                await safe_respond(interaction, content=f"⏳ Slow down a little — try again in {wait:.1f}s.", ephemeral=True)
+                return
+            return await func(self, interaction, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+async def check_cooldown_inline(interaction: discord.Interaction, key: str, seconds: float) -> bool:
+    """For dynamically-created button callbacks (closures) that can't use
+    the @button_cooldown decorator. Returns True if the action is allowed
+    to proceed; sends the wait message and returns False otherwise."""
+    wait = cooldowns.remaining(interaction.user.id, key, seconds)
+    if wait > 0:
+        await safe_respond(interaction, content=f"⏳ Slow down a little — try again in {wait:.1f}s.", ephemeral=True)
+        return False
+    return True
+
+
 def clean_username(name: str) -> str:
     """Sanitize username for channel names."""
     return "".join(c for c in name.lower() if c.isalnum() or c in ("-", "_"))[:12] or "user"
@@ -44,41 +105,60 @@ def is_adult_member(member: Optional[discord.Member]) -> bool:
     return any(role.id in adult_role_ids for role in member.roles)
 
 
+async def _fetch_one_media_item(vault_channel, item) -> Optional[dict]:
+    try:
+        mid = int(item["id"]) if isinstance(item, dict) else int(item)
+        is_video = isinstance(item, dict) and item.get("type") == "video"
+        msg = await vault_channel.fetch_message(mid)
+        if msg.attachments:
+            att = msg.attachments[0]
+            return {"url": att.url, "proxy_url": att.proxy_url, "is_video": is_video}
+    except Exception:
+        # Message id invalid/legacy entry, or message deleted from vault — skip it.
+        return None
+    return None
+
+
 async def resolve_profile_media(bot: commands.Bot, media_items) -> List[dict]:
     """Re-fetch each vault-channel message to obtain a fresh, non-expired
     signed attachment URL. Discord's CDN URLs are cryptographically signed
     and expire (~24h) regardless of whether anything was deleted, so we
     never store a raw URL long-term — only a message reference — and
     resolve it to a live URL each time a profile is actually displayed.
-    Returns a list of {"url": str, "is_video": bool}.
+    Fetches run in parallel — this used to be a sequential loop, meaning a
+    5-photo profile made 5 separate round trips to Discord's API back to
+    back before rendering could even start.
+    Returns a list of {"url": str, "proxy_url": str, "is_video": bool}.
     """
     if not media_items:
         return []
     vault_channel = bot.get_channel(config.CHANNEL_PHOTO_VAULT)
     if not vault_channel:
         return []
-    resolved = []
-    for item in media_items:
-        try:
-            mid = int(item["id"]) if isinstance(item, dict) else int(item)
-            is_video = isinstance(item, dict) and item.get("type") == "video"
-            msg = await vault_channel.fetch_message(mid)
-            if msg.attachments:
-                resolved.append({"url": msg.attachments[0].url, "is_video": is_video})
-        except Exception:
-            # Message id invalid/legacy entry, or message deleted from vault — skip it.
-            continue
-    return resolved
+    results = await asyncio.gather(*[_fetch_one_media_item(vault_channel, item) for item in media_items])
+    return [r for r in results if r is not None]
 
 
-MAX_PHOTO_FETCH_BYTES = 20 * 1024 * 1024  # defensive cap; draft() decoding handles normal photos fine regardless
+MAX_PHOTO_FETCH_BYTES = 8 * 1024 * 1024  # generous cap now that we request sized-down images, not originals
+THUMBNAIL_FETCH_SIZE = 160  # filmstrip is ~66px on screen; 160 covers retina displays with room to spare
+MAIN_IMAGE_FETCH_SIZE = 800  # card photo area is 640x560; 800 gives clean downscaling headroom
+
+
+def _sized_media_url(item: dict, size: int) -> str:
+    """Discord's media proxy supports on-the-fly resizing via ?width=&height=
+    query params — this lets us request an appropriately small image directly
+    instead of downloading a full-resolution original just to shrink it
+    locally, which was a major source of both bandwidth and latency."""
+    base = item.get("proxy_url") or item.get("url")
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}width={size}&height={size}"
 
 
 async def fetch_media_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     """Downloads raw image bytes for card rendering. Returns None on any
     failure — the renderer already draws a graceful placeholder box."""
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             if resp.status != 200:
                 return None
             if resp.content_length and resp.content_length > MAX_PHOTO_FETCH_BYTES:
@@ -95,10 +175,11 @@ MAX_VIDEO_ATTACH_BYTES = 24 * 1024 * 1024  # stay safely under Discord's 25MB de
 async def fetch_video_file(session: aiohttp.ClientSession, url: str) -> Optional[discord.File]:
     """Downloads the actual video so Discord can attach and natively play it
     (a PNG card can never play video — only a real video attachment can).
-    Returns None if the file is missing or too large to attach; the card
-    itself always shows a 'view original' style link as a fallback."""
+    Returns None if the file is missing, too large, or too slow to fetch;
+    the card gracefully shows a 'couldn't load' message in that case rather
+    than falsely claiming a video is attached when it isn't."""
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 return None
             content_length = resp.content_length
@@ -141,38 +222,74 @@ async def build_card_files(
     returning a ready-to-send list of discord.File — the card image, plus
     the actual video file when the active slide is a video (so Discord's
     native player can actually play it, which a static PNG never could).
-    `cache` (keyed by media index) lets a single card session — e.g.
+    `cache` (keyed by (kind, index)) lets a single card session — e.g.
     flipping through media on the same discovery card — avoid re-downloading
     images it already has. `executor` should be a small, dedicated
-    ThreadPoolExecutor (rather than the default shared one) so concurrent
-    renders from multiple users can't all pile up in parallel and spike
-    memory at once."""
-    thumbnails: List[Tuple[Optional[bytes], bool]] = []
-    for i, item in enumerate((media or [])[:5]):
-        is_vid = item.get("is_video", False)
-        if is_vid:
-            # No frame extraction — videos render as a placeholder + play icon
-            # in the card itself; the actual playable file is attached separately.
-            thumbnails.append((None, True))
-            continue
-        if cache is not None and i in cache:
-            thumbnails.append((cache[i], False))
-            continue
-        data = await fetch_media_bytes(session, item["url"])
-        if cache is not None:
-            cache[i] = data
-        thumbnails.append((data, False))
+    ThreadPoolExecutor so concurrent renders from multiple users can't all
+    pile up in parallel and spike memory at once.
 
-    main_bytes = None
+    Filmstrip thumbnails and the active hero photo are fetched at different,
+    appropriately small sizes (rather than full original resolution) and
+    entirely in parallel — this is what keeps a 5-photo profile card fast
+    instead of doing 5+ sequential multi-MB downloads."""
+    media = (media or [])[:5]
+
+    async def _get_thumb(i: int, item: dict):
+        if item.get("is_video"):
+            return ("thumb", i, None)
+        key = ("thumb", i)
+        if cache is not None and key in cache:
+            return ("thumb", i, cache[key])
+        data = await fetch_media_bytes(session, _sized_media_url(item, THUMBNAIL_FETCH_SIZE))
+        if cache is not None:
+            cache[key] = data
+        return ("thumb", i, data)
+
+    tasks = [_get_thumb(i, item) for i, item in enumerate(media)]
+
+    active_item = None
     is_video_active = False
-    video_file = None
     if media and 0 <= active_index < len(media):
         active_item = media[active_index]
         is_video_active = active_item.get("is_video", False)
-        if not is_video_active and active_index < len(thumbnails):
-            main_bytes = thumbnails[active_index][0]
-        elif is_video_active:
-            video_file = await fetch_video_file(session, active_item["url"])
+
+    async def _get_main():
+        key = ("main", active_index)
+        if cache is not None and key in cache:
+            return ("main", cache[key])
+        data = await fetch_media_bytes(session, _sized_media_url(active_item, MAIN_IMAGE_FETCH_SIZE))
+        if cache is not None:
+            cache[key] = data
+        return ("main", data)
+
+    async def _get_video():
+        f = await fetch_video_file(session, active_item["url"])
+        return ("video", f)
+
+    # Everything — every thumbnail plus the active hero image or video — is
+    # fetched in ONE concurrent batch. This used to be two sequential stages
+    # (all thumbnails, then separately the main image), which meant total
+    # latency was thumbnail_time + main_time; now it's max(all of them),
+    # since none of these requests actually depend on each other.
+    if active_item is not None:
+        tasks.append(_get_video() if is_video_active else _get_main())
+
+    results = await asyncio.gather(*tasks)
+
+    thumb_bytes_by_index: dict = {}
+    main_bytes = None
+    video_file = None
+    for r in results:
+        if r[0] == "thumb":
+            thumb_bytes_by_index[r[1]] = r[2]
+        elif r[0] == "main":
+            main_bytes = r[1]
+        elif r[0] == "video":
+            video_file = r[1]
+
+    thumbnails: List[Tuple[Optional[bytes], bool]] = [
+        (thumb_bytes_by_index.get(i), media[i].get("is_video", False)) for i in range(len(media))
+    ]
 
     loop = asyncio.get_event_loop()
     png_bytes = await loop.run_in_executor(
@@ -181,6 +298,7 @@ async def build_card_files(
             render_profile_card,
             main_image_bytes=main_bytes,
             is_video=is_video_active,
+            video_available=bool(video_file) if is_video_active else True,
             thumbnails=thumbnails,
             active_index=active_index,
             display_name=display_name,
@@ -324,6 +442,8 @@ class ChoiceStepView(discord.ui.View):
             if interaction.user.id != self.owner_id:
                 await safe_respond(interaction, content="This isn't your profile setup session.", ephemeral=True)
                 return
+            if not await check_cooldown_inline(interaction, "wizard_step_choice", 1.0):
+                return
             await self.on_choice(interaction, label)
         return callback
 
@@ -405,6 +525,8 @@ async def show_media_step(interaction: discord.Interaction, cog):
         if i2.user.id != interaction.user.id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
             return
+        if not await check_cooldown_inline(i2, "media_step_action", 1.5):
+            return
         await i2.response.edit_message(
             content=f"📸 Upload up to {MAX_MEDIA_ITEMS} photos/videos in your ticket, then press Confirm.",
             embed=None, view=None
@@ -414,6 +536,8 @@ async def show_media_step(interaction: discord.Interaction, cog):
     async def on_finish(i2: discord.Interaction):
         if i2.user.id != interaction.user.id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        if not await check_cooldown_inline(i2, "media_step_action", 1.5):
             return
         await recompute_dating_eligible(i2.user.id)
         missing = await get_missing_dating_requirements(i2.user.id)
@@ -449,6 +573,8 @@ async def show_media_edit_choice(interaction: discord.Interaction, cog, current_
             if i2.user.id != owner_id:
                 await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
                 return
+            if not await check_cooldown_inline(i2, "media_step_action", 1.5):
+                return
             await i2.response.edit_message(
                 content=f"You currently have {current_count}/{MAX_MEDIA_ITEMS} media items. Send up to {remaining} more in your ticket, then press Confirm.",
                 embed=None, view=None
@@ -463,6 +589,8 @@ async def show_media_edit_choice(interaction: discord.Interaction, cog, current_
     async def on_replace(i2: discord.Interaction):
         if i2.user.id != owner_id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        if not await check_cooldown_inline(i2, "media_step_action", 1.5):
             return
         await i2.response.edit_message(
             content=f"Your current media will be removed. Send your new media (up to {MAX_MEDIA_ITEMS}) in your ticket, then press Confirm.",
@@ -496,11 +624,15 @@ async def show_media_edit_prompt(interaction: discord.Interaction, cog):
         if i2.user.id != owner_id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
             return
+        if not await check_cooldown_inline(i2, "media_step_action", 1.5):
+            return
         await show_media_edit_choice(i2, cog, count)
 
     async def on_no(i2: discord.Interaction):
         if i2.user.id != owner_id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        if not await check_cooldown_inline(i2, "media_step_action", 1.5):
             return
         await recompute_dating_eligible(i2.user.id)
         missing = await get_missing_dating_requirements(i2.user.id)
@@ -519,6 +651,11 @@ async def finalize_single_field_edit(interaction: discord.Interaction, cog):
     check what's still missing and, if this profile isn't complete yet,
     offer a one-tap continuation into the next missing step rather than
     forcing the whole wizard again."""
+    # Always recompute here — this is the only finalize path reached when a
+    # profile is completed incrementally (e.g. stopped mid-wizard, finished
+    # the last field later via Edit Profile). Without this, dating_eligible
+    # could stay stuck at 0 forever even once every field is actually filled in.
+    await recompute_dating_eligible(interaction.user.id)
     missing = await get_missing_dating_requirements(interaction.user.id)
     if not missing:
         await interaction.response.edit_message(content="✅ Profile updated!", embed=None, view=None)
@@ -546,11 +683,15 @@ async def finalize_single_field_edit(interaction: discord.Interaction, cog):
         if i2.user.id != owner_id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
             return
+        if not await check_cooldown_inline(i2, "wizard_step_choice", 1.0):
+            return
         await step_map[next_missing](i2, cog)
 
     async def on_later(i2: discord.Interaction):
         if i2.user.id != owner_id:
             await safe_respond(i2, content="This isn't your profile setup session.", ephemeral=True)
+            return
+        if not await check_cooldown_inline(i2, "wizard_step_choice", 1.0):
             return
         await i2.response.edit_message(
             content=f"✅ Saved. Still missing: {', '.join(missing)}.", embed=None, view=None
@@ -579,6 +720,7 @@ class EditChoiceView(discord.ui.View):
         return True
 
     @discord.ui.button(label="📝 About Me / Intentions / Interests", style=discord.ButtonStyle.primary)
+    @button_cooldown(1.5)
     async def edit_text(self, interaction: discord.Interaction, button: discord.ui.Button):
         current_bio, current_intent, current_interests = "", "", ""
         async with aiosqlite.connect(DB_PATH) as db:
@@ -605,22 +747,27 @@ class EditChoiceView(discord.ui.View):
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="🌎 Region", style=discord.ButtonStyle.secondary)
+    @button_cooldown(1.5)
     async def edit_region(self, interaction: discord.Interaction, button: discord.ui.Button):
         await show_region_step(interaction, self.cog, finalize_single_field_edit)
 
     @discord.ui.button(label="⚧ Gender", style=discord.ButtonStyle.secondary)
+    @button_cooldown(1.5)
     async def edit_gender(self, interaction: discord.Interaction, button: discord.ui.Button):
         await show_gender_step(interaction, self.cog, finalize_single_field_edit)
 
     @discord.ui.button(label="🎂 Age", style=discord.ButtonStyle.secondary)
+    @button_cooldown(1.5)
     async def edit_age(self, interaction: discord.Interaction, button: discord.ui.Button):
         await show_age_step(interaction, self.cog, finalize_single_field_edit)
 
     @discord.ui.button(label="❤️ Interested In", style=discord.ButtonStyle.secondary)
+    @button_cooldown(1.5)
     async def edit_interested_in(self, interaction: discord.Interaction, button: discord.ui.Button):
         await show_interested_in_step(interaction, self.cog, finalize_single_field_edit)
 
     @discord.ui.button(label="📸 Pictures/Media", style=discord.ButtonStyle.secondary)
+    @button_cooldown(1.5)
     async def edit_media(self, interaction: discord.Interaction, button: discord.ui.Button):
         await show_media_edit_prompt(interaction, self.cog)
 
@@ -723,6 +870,7 @@ class PhotoConfirmView(discord.ui.View):
         self.max_items = max_items
 
     @discord.ui.button(label="✅ Confirm Media", style=discord.ButtonStyle.green, custom_id="photo_ticket:confirm")
+    @button_cooldown(1.5)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ticket_owner_id:
             await safe_respond(interaction, content="Only the ticket owner can confirm media.", ephemeral=True)
@@ -793,8 +941,7 @@ class PhotoConfirmView(discord.ui.View):
                     await safe_respond(interaction, content="⚠️ Media storage isn't configured correctly. Please contact an admin.", ephemeral=True)
                     return
 
-                new_media = []
-                for att in found:
+                async def _upload_one(att):
                     try:
                         file = await att.to_file()
                         is_video = bool(att.content_type and att.content_type.startswith("video/"))
@@ -802,9 +949,13 @@ class PhotoConfirmView(discord.ui.View):
                             content=f"{'🎥' if is_video else '📸'} Profile media — <@{interaction.user.id}> (ticket #{self.ticket_id})",
                             file=file
                         )
-                        new_media.append({"id": vault_msg.id, "type": "video" if is_video else "photo"})
+                        return {"id": vault_msg.id, "type": "video" if is_video else "photo"}
                     except Exception:
                         logger.exception("Failed to archive a media item to the vault channel")
+                        return None
+
+                upload_results = await asyncio.gather(*[_upload_one(att) for att in found])
+                new_media = [r for r in upload_results if r is not None]
 
                 if not new_media:
                     await safe_respond(interaction, content="❌ Failed to save media permanently. Please try again.", ephemeral=True)
@@ -875,6 +1026,7 @@ class DiscoveryCardView(discord.ui.View):
         return await self.cog.build_discovery_card_files(self.candidate, self.media_index, guild, cache=self._media_cache)
 
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary, custom_id="discovery:prev")
+    @button_cooldown(1.2, key="discovery_media_nav")
     async def prev_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
         media = self.candidate.get("media", [])
         if not media:
@@ -886,6 +1038,7 @@ class DiscoveryCardView(discord.ui.View):
         await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
+    @button_cooldown(1.2, key="discovery_media_nav")
     async def next_photo(self, interaction: discord.Interaction, button: discord.ui.Button):
         media = self.candidate.get("media", [])
         if not media:
@@ -897,6 +1050,7 @@ class DiscoveryCardView(discord.ui.View):
         await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
+    @button_cooldown(1.0, key="discovery_swipe")
     async def handle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         liker_id = interaction.user.id
@@ -931,6 +1085,7 @@ class DiscoveryCardView(discord.ui.View):
         await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="❌ PASS", style=discord.ButtonStyle.secondary, custom_id=config.ID_DISCOVERY_PASS)
+    @button_cooldown(1.0, key="discovery_swipe")
     async def handle_pass(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Pass = simply skip this profile and move to the next one. No
         # lasting relationship between the two users beyond "don't show me
@@ -946,6 +1101,7 @@ class DiscoveryCardView(discord.ui.View):
         await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="🚫 BLOCK", style=discord.ButtonStyle.danger, custom_id=config.ID_DISCOVERY_BLOCK)
+    @button_cooldown(1.5, key="discovery_swipe")
     async def handle_block(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Block = a permanent, mutual safety action: unlike Pass, it stops
         # BOTH people from ever seeing, matching with, or contacting each
@@ -968,6 +1124,7 @@ class DiscoveryCardView(discord.ui.View):
         await self.cog.serve_next_candidate(interaction, edit_message_id=interaction.message.id)
 
     @discord.ui.button(label="ℹ️ INFO", style=discord.ButtonStyle.secondary, custom_id="discovery:info")
+    @button_cooldown(3.0, key="view_profile_render")
     async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await self.cog.show_user_profile(interaction, self.candidate["user_id"])
@@ -1023,6 +1180,7 @@ class ProfileMediaView(discord.ui.View):
         return True
 
     @discord.ui.button(label="◀ PREV", style=discord.ButtonStyle.primary)
+    @button_cooldown(1.2, key="profile_media_nav")
     async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
@@ -1032,6 +1190,7 @@ class ProfileMediaView(discord.ui.View):
         await interaction.edit_original_response(attachments=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
+    @button_cooldown(1.2, key="profile_media_nav")
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
@@ -1406,17 +1565,16 @@ class DatingCog(commands.Cog):
         for cand in candidates:
             cand_id = cand[0]
             cand_gender = cand[2]
-            cand_interested_in = cand[11]
 
-            # Reciprocal Gender <-> Interested-In matching. "Everyone" is a
-            # wildcard on either side; otherwise both directions must agree.
+            # One-directional pool filtering: the viewer's own Interested In
+            # determines which gender pool they see (Everyone = both pools).
+            # This intentionally does NOT require the candidate's own
+            # Interested In to reciprocally match — that stricter mutual
+            # check was filtering out entire valid pools whenever a group's
+            # stated preference didn't happen to point back at the viewer.
             if user_interested_in and user_interested_in != "Everyone":
                 wanted_gender = INTEREST_TO_GENDER.get(user_interested_in)
                 if wanted_gender and cand_gender != wanted_gender:
-                    continue
-            if cand_interested_in and cand_interested_in != "Everyone":
-                cand_wanted_gender = INTEREST_TO_GENDER.get(cand_interested_in)
-                if cand_wanted_gender and cand_wanted_gender != user_gender:
                     continue
 
             if await validate_dating_contact(user_id, cand_id):
@@ -1620,7 +1778,9 @@ class DatingCog(commands.Cog):
         for i in range(max_media):
             idx = i
 
-            async def jump_callback(interaction2: discord.Interaction, button: discord.ui.Button, index=idx, viewref=view):
+            async def jump_callback(interaction2: discord.Interaction, index=idx, viewref=view):
+                if not await check_cooldown_inline(interaction2, "discovery_media_nav", 1.2):
+                    return
                 viewref.media_index = index
                 await interaction2.response.defer()
                 jump_files = await viewref._render_files(interaction2.guild)
@@ -1723,10 +1883,19 @@ class DatingCog(commands.Cog):
         await safe_respond(interaction, files=files, view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
+    @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
     async def view_profile_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
         await interaction.response.defer(ephemeral=True)
         target = member or interaction.user
         await self.show_user_profile(interaction, target.id)
+
+    @view_profile_cmd.error
+    async def view_profile_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await safe_respond(interaction, content=f"⏳ Slow down — try again in {error.retry_after:.1f}s.", ephemeral=True)
+        else:
+            logger.exception("Unhandled error in /profile", exc_info=error)
+            await safe_respond(interaction, content="❌ An unexpected error occurred.", ephemeral=True)
 
     @app_commands.command(name="profile-check", description="Post your profile publicly in #profile-check for review. Open to everyone (10 min cooldown).")
     @app_commands.checks.cooldown(1, 600.0, key=lambda i: i.user.id)
