@@ -338,6 +338,31 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
             logger.exception("safe_respond failed to send followup")
 
 
+async def resend_card_message(interaction: discord.Interaction, old_message_id: Optional[int], *,
+                               content=None, files=None, view=None):
+    """Deletes the previous ephemeral card message (if any) and sends a
+    genuinely new one, rather than editing the existing message's
+    attachments in place.
+
+    This works around a known Discord mobile client bug: when a message is
+    EDITED to swap in a new image attachment (same message ID, new file),
+    the mobile app sometimes fails to invalidate its cached render of that
+    message and just shows a stuck/blank loader until the user navigates
+    away and back (e.g. switching channels) to force a refresh. A brand
+    new message always renders correctly the first time, since there's no
+    stale cache entry for that message ID to begin with."""
+    if old_message_id:
+        try:
+            await interaction.followup.delete_message(old_message_id)
+        except Exception:
+            pass
+    await safe_respond(
+        interaction, content=content,
+        files=files if files is not None else discord.utils.MISSING,
+        view=view, ephemeral=True
+    )
+
+
 async def apply_role_change(interaction: discord.Interaction, role_dict: dict, chosen_label: str, db_column: str):
     """Shared handler for Region/Gender/Age/Interested-In selections:
     removes any existing role from that category and assigns the new one,
@@ -1035,7 +1060,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index - 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await interaction.edit_original_response(attachments=files, view=self)
+        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     @button_cooldown(1.2, key="discovery_media_nav")
@@ -1047,7 +1072,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index + 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await interaction.edit_original_response(attachments=files, view=self)
+        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     @button_cooldown(1.0, key="discovery_swipe")
@@ -1181,7 +1206,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index - 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await interaction.edit_original_response(attachments=files, view=self)
+        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
     @button_cooldown(1.2, key="profile_media_nav")
@@ -1191,7 +1216,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index + 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await interaction.edit_original_response(attachments=files, view=self)
+        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in ProfileMediaView item %r", item)
@@ -1788,7 +1813,7 @@ class DatingCog(commands.Cog):
                 viewref.media_index = index
                 await interaction2.response.defer()
                 jump_files = await viewref._render_files(interaction2.guild)
-                await interaction2.edit_original_response(attachments=jump_files, view=viewref)
+                await resend_card_message(interaction2, interaction2.message.id, files=jump_files, view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1802,11 +1827,8 @@ class DatingCog(commands.Cog):
         view.add_item(indicator_btn)
 
         if edit_message_id:
-            try:
-                await interaction.followup.edit_message(edit_message_id, content=None, attachments=files, view=view)
-                return
-            except Exception:
-                pass
+            await resend_card_message(interaction, edit_message_id, files=files, view=view)
+            return
         await safe_respond(interaction, files=files, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
