@@ -8,6 +8,7 @@ from discord.ext import commands, tasks
 import config
 from database import DB_PATH
 from cogs.setup import DiscoveryEntryView, ProfileManagementView, safe_respond, get_dating_cog
+from cogs.dating import button_cooldown
 
 logger = logging.getLogger("LooksMatch.Admin")
 
@@ -19,6 +20,7 @@ class LikedYouView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="🤩 VIEW WHO LIKED YOU", style=discord.ButtonStyle.success, custom_id=config.ID_VIEW_LIKED_YOU)
+    @button_cooldown(2.0)
     async def view_liked_you(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         dating_cog = get_dating_cog(interaction.client)
@@ -39,6 +41,7 @@ class MyRatingView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="⭐ VIEW MY RATING", style=discord.ButtonStyle.primary, custom_id=config.ID_MY_RATING_VIEW)
+    @button_cooldown(1.5)
     async def view_my_rating(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -239,6 +242,31 @@ class AdminCog(commands.Cog):
                 await db.commit()
 
             await interaction.response.send_message(f"🔒 Audit completed: {invalidated} invalid age pair matches invalidated.", ephemeral=True)
+
+        elif action == "resync-eligibility":
+            # One-time repair for a bug where completing a profile
+            # incrementally (via Edit Profile rather than the original
+            # unbroken creation wizard) could leave dating_eligible stuck
+            # at 0 forever even once every required field was filled in.
+            await interaction.response.defer(ephemeral=True)
+            from cogs.dating import recompute_dating_eligible
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT user_id, dating_eligible FROM users") as cursor:
+                    rows = await cursor.fetchall()
+
+            changed = 0
+            for user_id, was_eligible in rows:
+                await recompute_dating_eligible(user_id)
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT COUNT(*) FROM users WHERE dating_eligible = 1") as c:
+                    now_eligible = (await c.fetchone())[0]
+
+            await interaction.followup.send(
+                f"🔄 Resynced eligibility for {len(rows)} users. {now_eligible} are now marked dating-eligible.",
+                ephemeral=True
+            )
 
 
 async def setup(bot):
