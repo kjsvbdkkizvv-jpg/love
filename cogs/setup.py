@@ -6,6 +6,7 @@ from discord.ext import commands
 
 import config
 from database import DB_PATH
+from cogs.dating import button_cooldown
 
 logger = logging.getLogger("LooksMatch.Setup")
 
@@ -46,6 +47,7 @@ class DiscoveryEntryView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="💕 START DATING", style=discord.ButtonStyle.green, custom_id=config.ID_START_DATING)
+    @button_cooldown(2.0, key="start_dating")
     async def start_dating(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         dating_cog = get_dating_cog(interaction.client)
@@ -75,6 +77,7 @@ class ProfileManagementView(discord.ui.View):
                 return (await c.fetchone()) is not None
 
     @discord.ui.button(label="👤 VIEW PROFILE", style=discord.ButtonStyle.primary, custom_id=config.ID_VIEW_PROFILE)
+    @button_cooldown(3.0, key="view_profile_render")
     async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Defer immediately — building the profile card involves several
         # Discord API calls plus image download/compositing, which can
@@ -87,6 +90,7 @@ class ProfileManagementView(discord.ui.View):
         await dating_cog.show_user_profile(interaction, interaction.user.id)
 
     @discord.ui.button(label="🆕 CREATE PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_CREATE_PROFILE)
+    @button_cooldown(2.0)
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         # No pre-existing age-role check here: the wizard's own Age step is
         # where a real (adult-only) role gets assigned. Requiring one to
@@ -107,6 +111,7 @@ class ProfileManagementView(discord.ui.View):
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="✏️ EDIT PROFILE", style=discord.ButtonStyle.secondary, custom_id=config.ID_EDIT_PROFILE)
+    @button_cooldown(1.5)
     async def edit_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._has_profile(interaction.user.id):
             await safe_respond(
@@ -124,6 +129,7 @@ class ProfileManagementView(discord.ui.View):
         await safe_respond(interaction, embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="⏸️ PAUSE DATING", style=discord.ButtonStyle.danger, custom_id=config.ID_PAUSE_DATING)
+    @button_cooldown(2.0)
     async def pause_dating(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -154,6 +160,7 @@ class OnboardingProfileView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="✏️ CREATE DATING PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_ONBOARDING_SETUP_PROFILE)
+    @button_cooldown(2.0)
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         from cogs.dating import ProfileEditModal
 
