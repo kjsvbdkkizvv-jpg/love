@@ -338,29 +338,21 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
             logger.exception("safe_respond failed to send followup")
 
 
-async def resend_card_message(interaction: discord.Interaction, old_message_id: Optional[int], *,
-                               content=None, files=None, view=None):
-    """Deletes the previous ephemeral card message (if any) and sends a
-    genuinely new one, rather than editing the existing message's
-    attachments in place.
-
-    This works around a known Discord mobile client bug: when a message is
-    EDITED to swap in a new image attachment (same message ID, new file),
-    the mobile app sometimes fails to invalidate its cached render of that
-    message and just shows a stuck/blank loader until the user navigates
-    away and back (e.g. switching channels) to force a refresh. A brand
-    new message always renders correctly the first time, since there's no
-    stale cache entry for that message ID to begin with."""
-    if old_message_id:
-        try:
-            await interaction.followup.delete_message(old_message_id)
-        except Exception:
-            pass
-    await safe_respond(
-        interaction, content=content,
-        files=files if files is not None else discord.utils.MISSING,
-        view=view, ephemeral=True
-    )
+def wrap_card_embed(files: List[discord.File]) -> Optional[discord.Embed]:
+    """Wraps the rendered card PNG in an embed via an attachment:// image
+    reference, instead of sending it as a bare file attachment. Discord's
+    embed image renderer has a more established, reliable rendering path
+    than plain attachment previews, which is worth trying since the raw
+    first-load-doesn't-render issue reported on mobile pointed at how the
+    image itself was being delivered, not at editing-vs-resending the
+    message. The file must still be included in the same send/edit call
+    (attachments=files) for attachment:// to resolve — this only changes
+    how it's displayed, not whether it's uploaded."""
+    if not files:
+        return None
+    embed = discord.Embed(color=config.PRIMARY_COLOR)
+    embed.set_image(url=f"attachment://{files[0].filename}")
+    return embed
 
 
 async def apply_role_change(interaction: discord.Interaction, role_dict: dict, chosen_label: str, db_column: str):
@@ -1060,7 +1052,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index - 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
+        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     @button_cooldown(1.2, key="discovery_media_nav")
@@ -1072,7 +1064,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index + 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
+        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     @button_cooldown(1.0, key="discovery_swipe")
@@ -1206,7 +1198,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index - 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
+        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
     @button_cooldown(1.2, key="profile_media_nav")
@@ -1216,7 +1208,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index + 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await resend_card_message(interaction, interaction.message.id, files=files, view=self)
+        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in ProfileMediaView item %r", item)
@@ -1813,7 +1805,7 @@ class DatingCog(commands.Cog):
                 viewref.media_index = index
                 await interaction2.response.defer()
                 jump_files = await viewref._render_files(interaction2.guild)
-                await resend_card_message(interaction2, interaction2.message.id, files=jump_files, view=viewref)
+                await interaction2.edit_original_response(attachments=jump_files, embed=wrap_card_embed(jump_files), view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1827,9 +1819,12 @@ class DatingCog(commands.Cog):
         view.add_item(indicator_btn)
 
         if edit_message_id:
-            await resend_card_message(interaction, edit_message_id, files=files, view=view)
-            return
-        await safe_respond(interaction, files=files, view=view, ephemeral=True)
+            try:
+                await interaction.followup.edit_message(edit_message_id, content=None, embed=wrap_card_embed(files), attachments=files, view=view)
+                return
+            except Exception:
+                pass
+        await safe_respond(interaction, embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
         candidate = await self.get_next_liked_you_candidate(interaction.user.id)
@@ -1839,7 +1834,7 @@ class DatingCog(commands.Cog):
 
         view = DiscoveryCardView(candidate, 0, self)
         files = await self.build_discovery_card_files(candidate, 0, interaction.guild, cache=view._media_cache)
-        await safe_respond(interaction, content="🤩 **This person liked your profile!**", files=files, view=view, ephemeral=True)
+        await safe_respond(interaction, content="🤩 **This person liked your profile!**", embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
         if interaction.user.id != target_id:
@@ -1906,7 +1901,7 @@ class DatingCog(commands.Cog):
                 executor=self._render_executor,
             )
 
-        await safe_respond(interaction, files=files, view=view, ephemeral=True)
+        await safe_respond(interaction, embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
@@ -1979,7 +1974,7 @@ class DatingCog(commands.Cog):
             await safe_respond(
                 interaction,
                 content="📝 **PUBLIC PROFILE REVIEW** — community members can leave feedback below!",
-                files=files, view=view, ephemeral=False
+                embed=wrap_card_embed(files), files=files, view=view, ephemeral=False
             )
         except Exception:
             logger.exception("Error in /profile-check")
