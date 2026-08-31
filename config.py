@@ -9,7 +9,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "/app/data/looksmatch.db")
 
 # Theme Color Configuration (#794162)
-PRIMARY_COLOR = discord.Color.from_str("#794162")
+PRIMARY_COLOR = discord.Color.from_str("#FF69B4")  # hot pink
 
 # Channel & Category Explicit ID Configuration
 CHANNEL_DISCOVER = int(os.getenv("CHANNEL_DISCOVER", "1541041359769706586"))
