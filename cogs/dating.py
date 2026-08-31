@@ -338,21 +338,16 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
             logger.exception("safe_respond failed to send followup")
 
 
-def wrap_card_embed(files: List[discord.File]) -> Optional[discord.Embed]:
+def wrap_card_embeds(files: List[discord.File]) -> List[discord.Embed]:
     """Wraps the rendered card PNG in an embed via an attachment:// image
     reference, instead of sending it as a bare file attachment. Discord's
     embed image renderer has a more established, reliable rendering path
-    than plain attachment previews, which is worth trying since the raw
-    first-load-doesn't-render issue reported on mobile pointed at how the
-    image itself was being delivered, not at editing-vs-resending the
-    message. The file must still be included in the same send/edit call
-    (attachments=files) for attachment:// to resolve — this only changes
-    how it's displayed, not whether it's uploaded."""
+    than plain attachment previews. When a video file is also present
+    (files[1]), it's still sent as a plain second attachment — Discord
+    natively renders that as its own playable video player already."""
     if not files:
-        return None
-    embed = discord.Embed(color=config.PRIMARY_COLOR)
-    embed.set_image(url=f"attachment://{files[0].filename}")
-    return embed
+        return []
+    return [discord.Embed(color=config.PRIMARY_COLOR).set_image(url=f"attachment://{files[0].filename}")]
 
 
 async def apply_role_change(interaction: discord.Interaction, role_dict: dict, chosen_label: str, db_column: str):
@@ -1052,7 +1047,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index - 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
+        await interaction.edit_original_response(attachments=files, embeds=wrap_card_embeds(files), view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary, custom_id="discovery:next")
     @button_cooldown(1.2, key="discovery_media_nav")
@@ -1064,7 +1059,7 @@ class DiscoveryCardView(discord.ui.View):
         self.media_index = (self.media_index + 1) % len(media)
         await interaction.response.defer()
         files = await self._render_files(interaction.guild)
-        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
+        await interaction.edit_original_response(attachments=files, embeds=wrap_card_embeds(files), view=self)
 
     @discord.ui.button(label="❤️ LIKE", style=discord.ButtonStyle.green, custom_id=config.ID_DISCOVERY_LIKE)
     @button_cooldown(1.0, key="discovery_swipe")
@@ -1198,7 +1193,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index - 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
+        await interaction.edit_original_response(attachments=files, embeds=wrap_card_embeds(files), view=self)
 
     @discord.ui.button(label="NEXT ▶", style=discord.ButtonStyle.primary)
     @button_cooldown(1.2, key="profile_media_nav")
@@ -1208,7 +1203,7 @@ class ProfileMediaView(discord.ui.View):
         self.index = (self.index + 1) % len(self.media)
         await interaction.response.defer()
         files = await self.render_files()
-        await interaction.edit_original_response(attachments=files, embed=wrap_card_embed(files), view=self)
+        await interaction.edit_original_response(attachments=files, embeds=wrap_card_embeds(files), view=self)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in ProfileMediaView item %r", item)
@@ -1237,6 +1232,216 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
     return True
 
 
+class MatchReportModal(discord.ui.Modal, title="Report this match"):
+    def __init__(self, match_id: int, reporter_id: int, reported_id: int):
+        super().__init__()
+        self.match_id = match_id
+        self.reporter_id = reporter_id
+        self.reported_id = reported_id
+        self.reason = discord.ui.TextInput(
+            label="What happened?",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        embed = discord.Embed(title="🚩 Match Reported", color=discord.Color.red())
+        embed.add_field(name="Reporter", value=f"<@{self.reporter_id}>", inline=True)
+        embed.add_field(name="Reported", value=f"<@{self.reported_id}>", inline=True)
+        embed.add_field(name="Ticket", value=interaction.channel.mention, inline=True)
+        embed.add_field(name="Reason", value=self.reason.value, inline=False)
+
+        report_channel_id = getattr(config, "CHANNEL_MATCH_REPORTS", None)
+        report_channel = interaction.guild.get_channel(report_channel_id) if report_channel_id else None
+        if report_channel:
+            try:
+                staff_role_id = getattr(config, "ROLE_STAFF", None)
+                ping = f"<@&{staff_role_id}>" if staff_role_id else None
+                await report_channel.send(content=ping, embed=embed)
+            except Exception:
+                logger.exception("Failed to post match report to report channel")
+        else:
+            logger.warning("CHANNEL_MATCH_REPORTS not configured — report was not posted anywhere: %s", embed.to_dict())
+
+        # Give staff visibility into the actual ticket so they can investigate directly.
+        staff_role_id = getattr(config, "ROLE_STAFF", None)
+        staff_role = interaction.guild.get_role(staff_role_id) if staff_role_id else None
+        if staff_role:
+            try:
+                await interaction.channel.set_permissions(staff_role, view_channel=True, read_message_history=True, reason="Match reported")
+            except Exception:
+                logger.exception("Failed to grant staff access to reported match ticket")
+
+        await safe_respond(interaction, content="🚩 Report submitted — a staff member will review this ticket.", ephemeral=True)
+
+
+class ConfirmCloseView(discord.ui.View):
+    """Short-lived confirmation step for closing a match ticket, so a stray
+    click can't instantly end a match and delete the channel."""
+
+    def __init__(self, match_id: int, channel_id: int, voice_channel_id: Optional[int]):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+        self.channel_id = channel_id
+        self.voice_channel_id = voice_channel_id
+
+    @discord.ui.button(label="Yes, close it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE matches SET status = 'ENDED_BY_USER', closed_at = CURRENT_TIMESTAMP WHERE match_id = ?",
+                (self.match_id,)
+            )
+            await db.commit()
+
+        if self.voice_channel_id:
+            vc = interaction.guild.get_channel(self.voice_channel_id)
+            if vc:
+                try:
+                    await vc.delete(reason="Match ticket closed")
+                except Exception:
+                    pass
+
+        await safe_respond(interaction, content="🔒 Match closed. This channel will be deleted shortly.", ephemeral=True)
+        ch = interaction.guild.get_channel(self.channel_id)
+        if ch:
+            try:
+                await ch.send("🔒 This match ticket has been closed and will be deleted in a few seconds.")
+                await asyncio.sleep(4)
+                await ch.delete(reason="Match ticket closed by user")
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — the ticket stays open.", view=None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in ConfirmCloseView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong.", ephemeral=True)
+
+
+class MatchControlView(discord.ui.View):
+    """Persistent control panel posted in every match ticket. Registered
+    once via bot.add_view() (not per-match), so each button callback looks
+    up the relevant match record from the channel it was clicked in rather
+    than storing match-specific state on the view instance — the same
+    pattern used by the other persistent panels (DiscoveryEntryView, etc.),
+    and what makes this survive bot restarts correctly."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _get_match(self, channel_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT match_id, user_a, user_b, status, voice_channel_id FROM matches WHERE ticket_channel_id = ?",
+                (channel_id,)
+            ) as c:
+                return await c.fetchone()
+
+    @discord.ui.button(label="🎙️ Voice Channel", style=discord.ButtonStyle.primary, custom_id=config.ID_MATCH_VOICE)
+    @button_cooldown(3.0, key="match_voice")
+    async def create_voice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        match = await self._get_match(interaction.channel.id)
+        if not match:
+            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
+            return
+        match_id, user_a, user_b, status, voice_channel_id = match
+
+        if interaction.user.id not in (user_a, user_b):
+            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
+            return
+        if status != "ACTIVE":
+            await safe_respond(interaction, content="This match has already ended.", ephemeral=True)
+            return
+
+        if voice_channel_id:
+            existing = interaction.guild.get_channel(voice_channel_id)
+            if existing:
+                await safe_respond(interaction, content=f"🎙️ You already have a voice channel: {existing.mention}", ephemeral=True)
+                return
+
+        category = interaction.guild.get_channel(config.CATEGORY_MATCH_VOICE) if config.CATEGORY_MATCH_VOICE else None
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=False),
+            interaction.guild.me: discord.PermissionOverwrite(connect=True, view_channel=True, manage_channels=True),
+        }
+        member_a = interaction.guild.get_member(user_a)
+        member_b = interaction.guild.get_member(user_b)
+        if member_a:
+            overwrites[member_a] = discord.PermissionOverwrite(connect=True, view_channel=True, speak=True)
+        if member_b:
+            overwrites[member_b] = discord.PermissionOverwrite(connect=True, view_channel=True, speak=True)
+
+        try:
+            vc = await interaction.guild.create_voice_channel(name=f"match-voice-{match_id}", category=category, overwrites=overwrites)
+        except Exception:
+            logger.exception("Failed to create match voice channel")
+            await safe_respond(interaction, content="❌ Failed to create the voice channel — check my Manage Channels permission.", ephemeral=True)
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE matches SET voice_channel_id = ? WHERE match_id = ?", (vc.id, match_id))
+            await db.commit()
+
+        await safe_respond(
+            interaction,
+            content=f"🎙️ Voice channel created: {vc.mention} — it'll automatically be removed after an hour of being empty.",
+            ephemeral=False
+        )
+
+    @discord.ui.button(label="🚩 Report", style=discord.ButtonStyle.danger, custom_id=config.ID_MATCH_REPORT)
+    @button_cooldown(5.0, key="match_report")
+    async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = await self._get_match(interaction.channel.id)
+        if not match:
+            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
+            return
+        match_id, user_a, user_b, status, voice_channel_id = match
+
+        if interaction.user.id not in (user_a, user_b):
+            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
+            return
+
+        other_id = user_b if interaction.user.id == user_a else user_a
+        modal = MatchReportModal(match_id, interaction.user.id, other_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.secondary, custom_id=config.ID_MATCH_CLOSE)
+    @button_cooldown(2.0, key="match_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = await self._get_match(interaction.channel.id)
+        if not match:
+            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
+            return
+        match_id, user_a, user_b, status, voice_channel_id = match
+
+        if interaction.user.id not in (user_a, user_b):
+            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
+            return
+        if status != "ACTIVE":
+            await safe_respond(interaction, content="This match has already ended.", ephemeral=True)
+            return
+
+        view = ConfirmCloseView(match_id, interaction.channel.id, voice_channel_id)
+        await safe_respond(
+            interaction,
+            content="Are you sure you want to close this match? This ends it for both of you and deletes this channel.",
+            view=view, ephemeral=True
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.exception("Error in MatchControlView item %r", item)
+        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
+
+
 class DatingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -1257,6 +1462,7 @@ class DatingCog(commands.Cog):
     async def cog_load(self):
         self.voice_cleanup_task.start()
         self._http_session = aiohttp.ClientSession()
+        self.bot.add_view(MatchControlView())
         # Idempotent schema migration for existing deployments: add mode/max_items
         # to photo_tickets if they aren't already there.
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1739,11 +1945,23 @@ class DatingCog(commands.Cog):
 
         welcome_embed = discord.Embed(
             title="💕 YOU MATCHED!",
-            description=f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\nYou both liked each other. This is your private match ticket to chat and create a voice room.",
+            description=(
+                f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\n"
+                "You both liked each other. This is your private match ticket."
+            ),
             color=config.PRIMARY_COLOR
         )
+        welcome_embed.add_field(
+            name="What can you do here?",
+            value=(
+                "🎙️ **Voice Channel** — spin up a private voice room for the two of you\n"
+                "🚩 **Report** — flag a problem for staff to review\n"
+                "🔒 **Close Ticket** — end the match and remove this channel"
+            ),
+            inline=False
+        )
         try:
-            await channel.send(embed=welcome_embed)
+            await channel.send(embed=welcome_embed, view=MatchControlView())
         except Exception:
             pass
         return channel
@@ -1805,7 +2023,7 @@ class DatingCog(commands.Cog):
                 viewref.media_index = index
                 await interaction2.response.defer()
                 jump_files = await viewref._render_files(interaction2.guild)
-                await interaction2.edit_original_response(attachments=jump_files, embed=wrap_card_embed(jump_files), view=viewref)
+                await interaction2.edit_original_response(attachments=jump_files, embeds=wrap_card_embeds(jump_files), view=viewref)
 
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary, custom_id=f"discovery:jump:{i+1}")
             btn.callback = jump_callback
@@ -1820,11 +2038,11 @@ class DatingCog(commands.Cog):
 
         if edit_message_id:
             try:
-                await interaction.followup.edit_message(edit_message_id, content=None, embed=wrap_card_embed(files), attachments=files, view=view)
+                await interaction.followup.edit_message(edit_message_id, content=None, embeds=wrap_card_embeds(files), attachments=files, view=view)
                 return
             except Exception:
                 pass
-        await safe_respond(interaction, embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
+        await safe_respond(interaction, embeds=wrap_card_embeds(files), files=files, view=view, ephemeral=True)
 
     async def serve_next_liked_you_candidate(self, interaction: discord.Interaction):
         candidate = await self.get_next_liked_you_candidate(interaction.user.id)
@@ -1834,7 +2052,7 @@ class DatingCog(commands.Cog):
 
         view = DiscoveryCardView(candidate, 0, self)
         files = await self.build_discovery_card_files(candidate, 0, interaction.guild, cache=view._media_cache)
-        await safe_respond(interaction, content="🤩 **This person liked your profile!**", embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
+        await safe_respond(interaction, content="🤩 **This person liked your profile!**", embeds=wrap_card_embeds(files), files=files, view=view, ephemeral=True)
 
     async def show_user_profile(self, interaction: discord.Interaction, target_id: int):
         if interaction.user.id != target_id:
@@ -1901,7 +2119,7 @@ class DatingCog(commands.Cog):
                 executor=self._render_executor,
             )
 
-        await safe_respond(interaction, embed=wrap_card_embed(files), files=files, view=view, ephemeral=True)
+        await safe_respond(interaction, embeds=wrap_card_embeds(files), files=files, view=view, ephemeral=True)
 
     @app_commands.command(name="profile", description="View a member's dating and rating profile card. Open to everyone.")
     @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
@@ -1974,7 +2192,7 @@ class DatingCog(commands.Cog):
             await safe_respond(
                 interaction,
                 content="📝 **PUBLIC PROFILE REVIEW** — community members can leave feedback below!",
-                embed=wrap_card_embed(files), files=files, view=view, ephemeral=False
+                embeds=wrap_card_embeds(files), files=files, view=view, ephemeral=False
             )
         except Exception:
             logger.exception("Error in /profile-check")
