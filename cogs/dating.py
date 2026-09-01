@@ -21,8 +21,15 @@ from card_renderer import render_profile_card
 
 logger = logging.getLogger("LooksMatch.Dating")
 
-PHOTO_TICKET_TIMEOUT = 600  # 10 minutes in seconds
 MAX_MEDIA_ITEMS = 5
+
+
+def get_tickets_cog(bot):
+    """The media/match ticket system now lives in cogs/tickets.py (TicketsCog)
+    — this looks it up at call time rather than importing it directly, since
+    dating.py must not depend on tickets.py at module load (tickets.py
+    already imports several helpers from here)."""
+    return bot.get_cog("TicketsCog")
 MAX_INTERESTS = 5
 
 # Label translation between the "Interested In" role set and the "Gender" role
@@ -564,12 +571,16 @@ async def show_media_step(interaction: discord.Interaction, cog):
 
 
 async def start_media_ticket(interaction: discord.Interaction, cog, mode: str, max_items: int):
+    tickets_cog = get_tickets_cog(interaction.client)
+    if not tickets_cog:
+        await safe_respond(interaction, content="⚠️ Media ticket system is currently unavailable.", ephemeral=True)
+        return
     if interaction.guild:
-        await cog.create_photo_ticket(interaction.guild, interaction.user, mode=mode, max_items=max_items)
+        await tickets_cog.create_photo_ticket(interaction.guild, interaction.user, mode=mode, max_items=max_items)
     else:
         # Running from a DM (e.g. the onboarding flow) — post the upload
         # request right here instead of requiring a guild channel.
-        await cog.create_dm_media_ticket(interaction.user, mode=mode, max_items=max_items)
+        await tickets_cog.create_dm_media_ticket(interaction.user, mode=mode, max_items=max_items)
 
 
 async def show_media_edit_choice(interaction: discord.Interaction, cog, current_count: int):
@@ -872,160 +883,6 @@ class ProfileEditModal(discord.ui.Modal, title="Create / Edit Dating Profile"):
             await safe_respond(interaction, content="❌ An error occurred while saving your profile.", ephemeral=True)
 
 
-class PhotoConfirmView(discord.ui.View):
-    def __init__(self, cog, ticket_id: int, ticket_owner_id: int, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.ticket_id = ticket_id
-        self.ticket_owner_id = ticket_owner_id
-        self.mode = mode
-        self.max_items = max_items
-
-    @discord.ui.button(label="✅ Confirm Media", style=discord.ButtonStyle.green, custom_id="photo_ticket:confirm")
-    @button_cooldown(1.5)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ticket_owner_id:
-            await safe_respond(interaction, content="Only the ticket owner can confirm media.", ephemeral=True)
-            return
-
-        # Layer 1 — immediate in-memory guard. No await happens between the
-        # check and the add, so two near-simultaneous clicks in this process
-        # cannot both pass this check.
-        if self.ticket_id in self.cog._confirming_tickets:
-            await safe_respond(interaction, content="⏳ Your media is already being processed — please wait.", ephemeral=True)
-            return
-        self.cog._confirming_tickets.add(self.ticket_id)
-
-        try:
-            # Layer 2 — disable the button immediately so re-clicking can't
-            # even generate a fresh interaction against it.
-            button.disabled = True
-            button.label = "Processing..."
-            try:
-                await interaction.response.edit_message(view=self)
-            except Exception:
-                if not interaction.response.is_done():
-                    await interaction.response.defer(ephemeral=True)
-
-            # Layer 3 — atomic DB guard. Only the request that actually flips
-            # confirmed 0->1 proceeds; this is the real idempotency guarantee,
-            # independent of the button state or in-memory set.
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "UPDATE photo_tickets SET confirmed = 1 WHERE ticket_id = ? AND confirmed = 0",
-                    (self.ticket_id,)
-                )
-                await db.commit()
-                won_guard = cursor.rowcount > 0
-
-            if not won_guard:
-                await safe_respond(interaction, content="✅ This ticket has already been confirmed.", ephemeral=True)
-                return
-
-            source_channel = interaction.channel
-            found = []
-            try:
-                async for msg in source_channel.history(limit=200, oldest_first=True):
-                    for att in msg.attachments:
-                        if att.content_type and (att.content_type.startswith("image/") or att.content_type.startswith("video/")):
-                            found.append(att)
-                    if len(found) >= self.max_items:
-                        break
-                found = found[:self.max_items]
-
-                if not found:
-                    # Nothing was actually processed — release the guard so they can retry.
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE photo_tickets SET confirmed = 0 WHERE ticket_id = ?", (self.ticket_id,))
-                        await db.commit()
-                    button.disabled = False
-                    button.label = "✅ Confirm Media"
-                    try:
-                        await interaction.message.edit(view=self)
-                    except Exception:
-                        pass
-                    await safe_respond(interaction, content="No uploaded photos or videos found. Please upload media directly (not links) and press Confirm again.", ephemeral=True)
-                    return
-
-                vault_channel = self.cog.bot.get_channel(config.CHANNEL_PHOTO_VAULT)
-                if not vault_channel:
-                    logger.error("CHANNEL_PHOTO_VAULT is not configured or accessible")
-                    await safe_respond(interaction, content="⚠️ Media storage isn't configured correctly. Please contact an admin.", ephemeral=True)
-                    return
-
-                async def _upload_one(att):
-                    try:
-                        file = await att.to_file()
-                        is_video = bool(att.content_type and att.content_type.startswith("video/"))
-                        vault_msg = await vault_channel.send(
-                            content=f"{'🎥' if is_video else '📸'} Profile media — <@{interaction.user.id}> (ticket #{self.ticket_id})",
-                            file=file
-                        )
-                        return {"id": vault_msg.id, "type": "video" if is_video else "photo"}
-                    except Exception:
-                        logger.exception("Failed to archive a media item to the vault channel")
-                        return None
-
-                upload_results = await asyncio.gather(*[_upload_one(att) for att in found])
-                new_media = [r for r in upload_results if r is not None]
-
-                if not new_media:
-                    await safe_respond(interaction, content="❌ Failed to save media permanently. Please try again.", ephemeral=True)
-                    return
-
-                async with aiosqlite.connect(DB_PATH) as db:
-                    existing_media = []
-                    if self.mode == "append":
-                        async with db.execute("SELECT photos FROM profiles WHERE user_id = ?", (interaction.user.id,)) as c:
-                            prow = await c.fetchone()
-                        if prow and prow[0]:
-                            try:
-                                existing_media = json.loads(prow[0])
-                            except Exception:
-                                existing_media = []
-
-                    final_media = (existing_media + new_media)[:MAX_MEDIA_ITEMS]
-                    primary = str(final_media[0]["id"]) if final_media else None
-
-                    await db.execute(
-                        "UPDATE profiles SET photos = ?, primary_photo = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-                        (json.dumps(final_media), primary, interaction.user.id)
-                    )
-                    async with db.execute("SELECT channel_id FROM photo_tickets WHERE ticket_id = ?", (self.ticket_id,)) as c:
-                        ticket_row = await c.fetchone()
-                    await db.commit()
-
-                await recompute_dating_eligible(interaction.user.id)
-                missing = await get_missing_dating_requirements(interaction.user.id)
-                note = "✅ Media saved to your profile! 🎉 Profile complete." if not missing else \
-                    f"✅ Media saved to your profile. Still missing: {', '.join(missing)} — revisit Edit Profile to finish."
-                await safe_respond(interaction, content=f"{note} Closing ticket...", ephemeral=True)
-
-                monitor_task = self.cog._photo_ticket_monitors.pop(self.ticket_id, None)
-                if monitor_task:
-                    monitor_task.cancel()
-
-                ticket_channel_id = ticket_row[0] if ticket_row else None
-                if ticket_channel_id:
-                    self.cog._photo_ticket_confirm_msgs.pop(ticket_channel_id, None)
-                    ticket_channel = self.cog.bot.get_channel(ticket_channel_id)
-                    if ticket_channel:
-                        try:
-                            await ticket_channel.delete(reason="Media upload confirmed by user")
-                        except Exception:
-                            pass
-
-            except Exception:
-                logger.exception("Error during confirm media")
-                await safe_respond(interaction, content="❌ An error occurred while confirming media. Try again.", ephemeral=True)
-        finally:
-            self.cog._confirming_tickets.discard(self.ticket_id)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logger.exception("Unhandled error in PhotoConfirmView item %r", item)
-        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
-
-
 class DiscoveryCardView(discord.ui.View):
     def __init__(self, candidate: dict, media_index: int, cog):
         super().__init__(timeout=300)
@@ -1081,7 +938,8 @@ class DiscoveryCardView(discord.ui.View):
 
         if is_mutual:
             try:
-                ticket_channel = await self.cog.create_match_ticket(interaction.guild, liker_id, target_id)
+                tickets_cog = get_tickets_cog(interaction.client)
+                ticket_channel = await tickets_cog.create_match_ticket(interaction.guild, liker_id, target_id) if tickets_cog else None
                 channel_mention = ticket_channel.mention if ticket_channel else "private match room"
                 await safe_respond(
                     interaction,
@@ -1232,222 +1090,10 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
     return True
 
 
-class MatchReportModal(discord.ui.Modal, title="Report this match"):
-    def __init__(self, match_id: int, reporter_id: int, reported_id: int):
-        super().__init__()
-        self.match_id = match_id
-        self.reporter_id = reporter_id
-        self.reported_id = reported_id
-        self.reason = discord.ui.TextInput(
-            label="What happened?",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=True
-        )
-        self.add_item(self.reason)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        embed = discord.Embed(title="🚩 Match Reported", color=discord.Color.red())
-        embed.add_field(name="Reporter", value=f"<@{self.reporter_id}>", inline=True)
-        embed.add_field(name="Reported", value=f"<@{self.reported_id}>", inline=True)
-        embed.add_field(name="Ticket", value=interaction.channel.mention, inline=True)
-        embed.add_field(name="Reason", value=self.reason.value, inline=False)
-
-        report_channel_id = getattr(config, "CHANNEL_MATCH_REPORTS", None)
-        report_channel = interaction.guild.get_channel(report_channel_id) if report_channel_id else None
-        if report_channel:
-            try:
-                staff_role_id = getattr(config, "ROLE_STAFF", None)
-                ping = f"<@&{staff_role_id}>" if staff_role_id else None
-                await report_channel.send(content=ping, embed=embed)
-            except Exception:
-                logger.exception("Failed to post match report to report channel")
-        else:
-            logger.warning("CHANNEL_MATCH_REPORTS not configured — report was not posted anywhere: %s", embed.to_dict())
-
-        # Give staff visibility into the actual ticket so they can investigate directly.
-        staff_role_id = getattr(config, "ROLE_STAFF", None)
-        staff_role = interaction.guild.get_role(staff_role_id) if staff_role_id else None
-        if staff_role:
-            try:
-                await interaction.channel.set_permissions(staff_role, view_channel=True, read_message_history=True, reason="Match reported")
-            except Exception:
-                logger.exception("Failed to grant staff access to reported match ticket")
-
-        await safe_respond(interaction, content="🚩 Report submitted — a staff member will review this ticket.", ephemeral=True)
-
-
-class ConfirmCloseView(discord.ui.View):
-    """Short-lived confirmation step for closing a match ticket, so a stray
-    click can't instantly end a match and delete the channel."""
-
-    def __init__(self, match_id: int, channel_id: int, voice_channel_id: Optional[int]):
-        super().__init__(timeout=60)
-        self.match_id = match_id
-        self.channel_id = channel_id
-        self.voice_channel_id = voice_channel_id
-
-    @discord.ui.button(label="Yes, close it", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE matches SET status = 'ENDED_BY_USER', closed_at = CURRENT_TIMESTAMP WHERE match_id = ?",
-                (self.match_id,)
-            )
-            await db.commit()
-
-        if self.voice_channel_id:
-            vc = interaction.guild.get_channel(self.voice_channel_id)
-            if vc:
-                try:
-                    await vc.delete(reason="Match ticket closed")
-                except Exception:
-                    pass
-
-        await safe_respond(interaction, content="🔒 Match closed. This channel will be deleted shortly.", ephemeral=True)
-        ch = interaction.guild.get_channel(self.channel_id)
-        if ch:
-            try:
-                await ch.send("🔒 This match ticket has been closed and will be deleted in a few seconds.")
-                await asyncio.sleep(4)
-                await ch.delete(reason="Match ticket closed by user")
-            except Exception:
-                pass
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled — the ticket stays open.", view=None)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logger.exception("Error in ConfirmCloseView item %r", item)
-        await safe_respond(interaction, content="⚠️ Something went wrong.", ephemeral=True)
-
-
-class MatchControlView(discord.ui.View):
-    """Persistent control panel posted in every match ticket. Registered
-    once via bot.add_view() (not per-match), so each button callback looks
-    up the relevant match record from the channel it was clicked in rather
-    than storing match-specific state on the view instance — the same
-    pattern used by the other persistent panels (DiscoveryEntryView, etc.),
-    and what makes this survive bot restarts correctly."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def _get_match(self, channel_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT match_id, user_a, user_b, status, voice_channel_id FROM matches WHERE ticket_channel_id = ?",
-                (channel_id,)
-            ) as c:
-                return await c.fetchone()
-
-    @discord.ui.button(label="🎙️ Voice Channel", style=discord.ButtonStyle.primary, custom_id=config.ID_MATCH_VOICE)
-    @button_cooldown(3.0, key="match_voice")
-    async def create_voice(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        match = await self._get_match(interaction.channel.id)
-        if not match:
-            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
-            return
-        match_id, user_a, user_b, status, voice_channel_id = match
-
-        if interaction.user.id not in (user_a, user_b):
-            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
-            return
-        if status != "ACTIVE":
-            await safe_respond(interaction, content="This match has already ended.", ephemeral=True)
-            return
-
-        if voice_channel_id:
-            existing = interaction.guild.get_channel(voice_channel_id)
-            if existing:
-                await safe_respond(interaction, content=f"🎙️ You already have a voice channel: {existing.mention}", ephemeral=True)
-                return
-
-        category = interaction.guild.get_channel(config.CATEGORY_MATCH_VOICE) if config.CATEGORY_MATCH_VOICE else None
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=False),
-            interaction.guild.me: discord.PermissionOverwrite(connect=True, view_channel=True, manage_channels=True),
-        }
-        member_a = interaction.guild.get_member(user_a)
-        member_b = interaction.guild.get_member(user_b)
-        if member_a:
-            overwrites[member_a] = discord.PermissionOverwrite(connect=True, view_channel=True, speak=True)
-        if member_b:
-            overwrites[member_b] = discord.PermissionOverwrite(connect=True, view_channel=True, speak=True)
-
-        try:
-            vc = await interaction.guild.create_voice_channel(name=f"match-voice-{match_id}", category=category, overwrites=overwrites)
-        except Exception:
-            logger.exception("Failed to create match voice channel")
-            await safe_respond(interaction, content="❌ Failed to create the voice channel — check my Manage Channels permission.", ephemeral=True)
-            return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE matches SET voice_channel_id = ? WHERE match_id = ?", (vc.id, match_id))
-            await db.commit()
-
-        await safe_respond(
-            interaction,
-            content=f"🎙️ Voice channel created: {vc.mention} — it'll automatically be removed after an hour of being empty.",
-            ephemeral=False
-        )
-
-    @discord.ui.button(label="🚩 Report", style=discord.ButtonStyle.danger, custom_id=config.ID_MATCH_REPORT)
-    @button_cooldown(5.0, key="match_report")
-    async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = await self._get_match(interaction.channel.id)
-        if not match:
-            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
-            return
-        match_id, user_a, user_b, status, voice_channel_id = match
-
-        if interaction.user.id not in (user_a, user_b):
-            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
-            return
-
-        other_id = user_b if interaction.user.id == user_a else user_a
-        modal = MatchReportModal(match_id, interaction.user.id, other_id)
-        await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.secondary, custom_id=config.ID_MATCH_CLOSE)
-    @button_cooldown(2.0, key="match_close")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = await self._get_match(interaction.channel.id)
-        if not match:
-            await safe_respond(interaction, content="⚠️ Couldn't find this match record.", ephemeral=True)
-            return
-        match_id, user_a, user_b, status, voice_channel_id = match
-
-        if interaction.user.id not in (user_a, user_b):
-            await safe_respond(interaction, content="This isn't your match ticket.", ephemeral=True)
-            return
-        if status != "ACTIVE":
-            await safe_respond(interaction, content="This match has already ended.", ephemeral=True)
-            return
-
-        view = ConfirmCloseView(match_id, interaction.channel.id, voice_channel_id)
-        await safe_respond(
-            interaction,
-            content="Are you sure you want to close this match? This ends it for both of you and deletes this channel.",
-            view=view, ephemeral=True
-        )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logger.exception("Error in MatchControlView item %r", item)
-        await safe_respond(interaction, content="⚠️ Something went wrong. Please try again.", ephemeral=True)
-
 
 class DatingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self._photo_ticket_confirm_msgs = {}  # channel_id -> confirm_message_id
-        self._photo_ticket_monitors = {}  # ticket_id -> task
-        self._confirming_tickets = set()  # in-memory spam-click guard
         self._last_served_candidate: dict = {}  # user_id -> candidate_user_id, prevents immediate repeats
         self._http_session: Optional[aiohttp.ClientSession] = None
         # Dedicated, small executor for card rendering. Using the default
@@ -1460,276 +1106,12 @@ class DatingCog(commands.Cog):
         self._render_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="card-render")
 
     async def cog_load(self):
-        self.voice_cleanup_task.start()
         self._http_session = aiohttp.ClientSession()
-        self.bot.add_view(MatchControlView())
-        # Idempotent schema migration for existing deployments: add mode/max_items
-        # to photo_tickets if they aren't already there.
-        async with aiosqlite.connect(DB_PATH) as db:
-            for stmt in (
-                "ALTER TABLE photo_tickets ADD COLUMN mode TEXT DEFAULT 'replace'",
-                "ALTER TABLE photo_tickets ADD COLUMN max_items INTEGER DEFAULT 5",
-            ):
-                try:
-                    await db.execute(stmt)
-                    await db.commit()
-                except Exception:
-                    pass  # column already exists
-        asyncio.create_task(self._recover_photo_tickets())
 
     async def cog_unload(self):
-        self.voice_cleanup_task.cancel()
-        for t in self._photo_ticket_monitors.values():
-            t.cancel()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
         self._render_executor.shutdown(wait=False)
-
-    @tasks.loop(minutes=1)
-    async def voice_cleanup_task(self):
-        now = datetime.datetime.utcnow()
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT match_id, voice_channel_id, voice_empty_since, ticket_channel_id FROM matches WHERE status = 'ACTIVE' AND voice_channel_id IS NOT NULL") as cursor:
-                active_vcs = await cursor.fetchall()
-
-            for match_id, vc_id, empty_since_str, ticket_id in active_vcs:
-                channel = self.bot.get_channel(vc_id)
-                if not channel:
-                    await db.execute("UPDATE matches SET voice_channel_id = NULL, voice_empty_since = NULL WHERE match_id = ?", (match_id,))
-                    await db.commit()
-                    continue
-
-                if len(channel.members) == 0:
-                    if not empty_since_str:
-                        await db.execute("UPDATE matches SET voice_empty_since = ? WHERE match_id = ?", (now.isoformat(), match_id))
-                        await db.commit()
-                    else:
-                        empty_start = datetime.datetime.fromisoformat(empty_since_str)
-                        if (now - empty_start).total_seconds() >= 3600:
-                            try:
-                                await channel.delete()
-                            except discord.HTTPException:
-                                pass
-                            await db.execute("UPDATE matches SET voice_channel_id = NULL, voice_empty_since = NULL WHERE match_id = ?", (match_id,))
-                            await db.commit()
-                            ticket_ch = self.bot.get_channel(ticket_id)
-                            if ticket_ch:
-                                try:
-                                    await ticket_ch.send("🎙️ *Match voice channel was automatically deleted due to 1 hour of inactivity.*")
-                                except discord.HTTPException:
-                                    pass
-                else:
-                    if empty_since_str:
-                        await db.execute("UPDATE matches SET voice_empty_since = NULL WHERE match_id = ?", (match_id,))
-                        await db.commit()
-
-    async def _recover_photo_tickets(self):
-        await asyncio.sleep(2)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT ticket_id, user_id, channel_id, created_at, mode, max_items FROM photo_tickets WHERE confirmed = 0") as cursor:
-                rows = await cursor.fetchall()
-
-        now = datetime.datetime.utcnow()
-        for ticket_id, user_id, channel_id, created_at, mode, max_items in rows:
-            try:
-                created_dt = now
-                if isinstance(created_at, str):
-                    try:
-                        created_dt = datetime.datetime.fromisoformat(created_at)
-                    except Exception:
-                        try:
-                            created_dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            created_dt = now
-
-                elapsed = (now - created_dt).total_seconds()
-                remaining = PHOTO_TICKET_TIMEOUT - int(elapsed)
-                if remaining <= 0:
-                    ch = self.bot.get_channel(channel_id)
-                    if ch:
-                        try: await ch.delete(reason="Media ticket expired during downtime")
-                        except Exception: pass
-                    try:
-                        user = await self.bot.fetch_user(user_id)
-                        await user.send("❌ Your media upload ticket expired while the bot was offline. Please re-open profile editing to try again.")
-                    except Exception:
-                        pass
-                    continue
-
-                channel = self.bot.get_channel(channel_id)
-                if not channel:
-                    # Not in cache — likely a DM channel that didn't survive
-                    # the restart. Re-resolve it via the user directly.
-                    try:
-                        user = await self.bot.fetch_user(user_id)
-                        dm = await user.create_dm()
-                        if dm.id == channel_id:
-                            channel = dm
-                    except Exception:
-                        channel = None
-                if channel:
-                    view = PhotoConfirmView(self, ticket_id, user_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS)
-                    try:
-                        msg = await channel.send("When you are ready, press Confirm Media below.", view=view)
-                        self._photo_ticket_confirm_msgs[channel.id] = msg.id
-                    except Exception:
-                        pass
-
-                task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel_id, user_id, remaining))
-                self._photo_ticket_monitors[ticket_id] = task
-            except Exception:
-                logger.exception("Error recovering ticket %s", ticket_id)
-
-    async def create_photo_ticket(self, guild: discord.Guild, user: discord.User, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
-        category = guild.get_channel(config.CATEGORY_PHOTO_TICKETS) if config.CATEGORY_PHOTO_TICKETS else guild.get_channel(config.CATEGORY_MATCHES)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
-        }
-        member = guild.get_member(user.id)
-        if member:
-            overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        name = f"media-ticket-{clean_username(user.name)}"
-        try:
-            channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
-        except Exception:
-            logger.exception("Failed to create ticket channel")
-            try:
-                await user.send("❌ I couldn't create a private ticket channel in the server. Please ensure the bot has Manage Channels permission.")
-            except Exception:
-                pass
-            return None
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "INSERT INTO photo_tickets (user_id, channel_id, mode, max_items) VALUES (?, ?, ?, ?)",
-                (user.id, channel.id, mode, max_items)
-            )
-            ticket_id = cursor.lastrowid
-            await db.commit()
-
-        embed = discord.Embed(
-            title="Upload your profile media",
-            description=(
-                f"Upload up to {max_items} item(s) in this ticket **as direct attachments** (photos or videos).\n"
-                "Pasted links are not supported — please upload the files themselves.\n"
-                "When you are happy with your media, press **Confirm Media** below.\n"
-                "If you do not confirm within 10 minutes the ticket will be removed and you'll be notified."
-            ),
-            color=config.PRIMARY_COLOR
-        )
-        view = PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items)
-        try:
-            confirm_msg = await channel.send(content=user.mention, embed=embed, view=view)
-            self._photo_ticket_confirm_msgs[channel.id] = confirm_msg.id
-        except Exception:
-            logger.exception("Failed to post confirm message in ticket")
-
-        try:
-            dm = await user.create_dm()
-            await dm.send(f"I created your media upload ticket: {channel.mention}. Upload media there and press Confirm when ready.", view=PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items))
-        except Exception:
-            pass
-
-        task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, channel.id, user.id, PHOTO_TICKET_TIMEOUT))
-        self._photo_ticket_monitors[ticket_id] = task
-        return channel
-
-    async def create_dm_media_ticket(self, user: discord.User, mode: str = "replace", max_items: int = MAX_MEDIA_ITEMS):
-        """DM equivalent of create_photo_ticket: no guild channel is created —
-        the user's DM with the bot IS the ticket, since it's already private
-        by nature."""
-        try:
-            dm = await user.create_dm()
-        except Exception:
-            logger.exception("Failed to open DM for media ticket")
-            return None
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "INSERT INTO photo_tickets (user_id, channel_id, mode, max_items) VALUES (?, ?, ?, ?)",
-                (user.id, dm.id, mode, max_items)
-            )
-            ticket_id = cursor.lastrowid
-            await db.commit()
-
-        embed = discord.Embed(
-            title="Upload your profile media",
-            description=(
-                f"Upload up to {max_items} item(s) right here in this DM **as direct attachments** (photos or videos).\n"
-                "Pasted links are not supported — please upload the files themselves.\n"
-                "When you are happy with your media, press **Confirm Media** below.\n"
-                "If you do not confirm within 10 minutes this request will expire and you'll be notified."
-            ),
-            color=config.PRIMARY_COLOR
-        )
-        view = PhotoConfirmView(self, ticket_id, user.id, mode=mode, max_items=max_items)
-        try:
-            confirm_msg = await dm.send(embed=embed, view=view)
-            self._photo_ticket_confirm_msgs[dm.id] = confirm_msg.id
-        except Exception:
-            logger.exception("Failed to post confirm message in DM")
-
-        task = asyncio.create_task(self._photo_ticket_monitor(ticket_id, dm.id, user.id, PHOTO_TICKET_TIMEOUT))
-        self._photo_ticket_monitors[ticket_id] = task
-        return dm
-
-    async def _photo_ticket_monitor(self, ticket_id: int, channel_id: int, user_id: int, timeout: int = PHOTO_TICKET_TIMEOUT):
-        try:
-            await asyncio.sleep(timeout)
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT confirmed FROM photo_tickets WHERE ticket_id = ?", (ticket_id,)) as c:
-                    row = await c.fetchone()
-            if row and row[0]:
-                return
-
-            channel = self.bot.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.delete(reason="Media ticket expired (no confirmation)")
-                except Exception:
-                    pass
-
-            try:
-                user = await self.bot.fetch_user(user_id)
-                dm = await user.create_dm()
-                await dm.send("❌ Your media upload ticket timed out (no confirmation within 10 minutes). You can re-open profile editing to try again.")
-            except Exception:
-                pass
-
-            self._photo_ticket_confirm_msgs.pop(channel_id, None)
-            self._photo_ticket_monitors.pop(ticket_id, None)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("Error in photo ticket monitor")
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
-        ch = message.channel
-        if ch.id in self._photo_ticket_confirm_msgs:
-            prev_id = self._photo_ticket_confirm_msgs.get(ch.id)
-            try:
-                if prev_id:
-                    prev = await ch.fetch_message(prev_id)
-                    try:
-                        await prev.delete()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT ticket_id, user_id, mode, max_items FROM photo_tickets WHERE channel_id = ?", (ch.id,)) as c:
-                    row = await c.fetchone()
-            if not row:
-                return
-            ticket_id, owner_id, mode, max_items = row
-            new_msg = await ch.send("When you are ready, press Confirm Media below.", view=PhotoConfirmView(self, ticket_id, owner_id, mode=mode or "replace", max_items=max_items or MAX_MEDIA_ITEMS))
-            self._photo_ticket_confirm_msgs[ch.id] = new_msg.id
 
     async def get_weighted_candidate(self, user_id: int, exclude_id: Optional[int] = None):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1915,56 +1297,6 @@ class DatingCog(commands.Cog):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("INSERT OR REPLACE INTO passes (user_id, target_id) VALUES (?, ?)", (user_id, target_id))
             await db.commit()
-
-    async def create_match_ticket(self, guild: discord.Guild, user_a_id: int, user_b_id: int) -> discord.TextChannel:
-        category = guild.get_channel(config.CATEGORY_MATCHES) if config.CATEGORY_MATCHES else None
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("INSERT INTO matches (user_a, user_b) VALUES (?, ?)", (user_a_id, user_b_id))
-            match_id = cursor.lastrowid
-            await db.commit()
-
-        user_a = guild.get_member(user_a_id)
-        user_b = guild.get_member(user_b_id)
-        name_a = clean_username(user_a.name if user_a else "user1")
-        name_b = clean_username(user_b.name if user_b else "user2")
-        ticket_name = f"💌・{name_a}-{name_b}"
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
-        }
-        if user_a: overwrites[user_a] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
-        if user_b: overwrites[user_b] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
-
-        channel = await guild.create_text_channel(name=ticket_name, category=category, overwrites=overwrites)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE matches SET ticket_channel_id = ? WHERE match_id = ?", (channel.id, match_id))
-            await db.commit()
-
-        welcome_embed = discord.Embed(
-            title="💕 YOU MATCHED!",
-            description=(
-                f"Congratulations {user_a.mention if user_a else user_a_id} & {user_b.mention if user_b else user_b_id}!\n"
-                "You both liked each other. This is your private match ticket."
-            ),
-            color=config.PRIMARY_COLOR
-        )
-        welcome_embed.add_field(
-            name="What can you do here?",
-            value=(
-                "🎙️ **Voice Channel** — spin up a private voice room for the two of you\n"
-                "🚩 **Report** — flag a problem for staff to review\n"
-                "🔒 **Close Ticket** — end the match and remove this channel"
-            ),
-            inline=False
-        )
-        try:
-            await channel.send(embed=welcome_embed, view=MatchControlView())
-        except Exception:
-            pass
-        return channel
 
     async def serve_next_candidate(self, interaction: discord.Interaction, edit_message_id: int = None):
         missing = await get_missing_dating_requirements(interaction.user.id)
