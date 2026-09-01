@@ -18,14 +18,19 @@ def get_dating_cog(bot):
 async def safe_respond(interaction: discord.Interaction, /, *, content=None, embed=None, view=None, ephemeral=True, **kwargs):
     """Send using response.send_message unless response is already used, then fallback to followup.send."""
     send_view = view if view is not None else discord.utils.MISSING
+    # See cogs/dating.py's safe_respond for why embed also needs this
+    # conversion: discord.py's embed/embeds mutual-exclusivity check is
+    # against MISSING, not None, so an explicit None still collides with
+    # an embeds=[...] list passed through **kwargs.
+    send_embed = embed if embed is not None else discord.utils.MISSING
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.response.send_message(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
         else:
-            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
     except Exception:
         try:
-            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
         except Exception:
             logger.exception("safe_respond failed to send followup")
 
@@ -167,15 +172,12 @@ class OnboardingProfileView(discord.ui.View):
         dating_cog = get_dating_cog(interaction.client)
         modal = ProfileEditModal(dating_cog, is_new_profile=True)
         await interaction.response.send_modal(modal)
-
-        if interaction.guild:
-            member = interaction.guild.get_member(interaction.user.id)
-            role = interaction.guild.get_role(config.ROLE_CREATE_DATING_PROFILE)
-            if member and role and role in member.roles:
-                try:
-                    await member.remove_roles(role, reason="Completed onboarding dating profile setup")
-                except Exception:
-                    logger.exception("Failed to remove onboarding role")
+        # Note: the @Create Dating Profile role is intentionally NOT removed
+        # here. Removing it on click (before the modal is even submitted,
+        # let alone the rest of the wizard completed) meant abandoning
+        # partway through silently lost the prompt. It's now removed
+        # centrally in recompute_dating_eligible, the moment the profile
+        # actually becomes complete — see cogs/dating.py.
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.exception("Error in OnboardingProfileView item %r", item)
