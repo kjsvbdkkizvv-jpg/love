@@ -64,6 +64,7 @@ async def main():
         "cogs.dating",
         "cogs.rating",
         "cogs.levels",
+        "cogs.tickets",
         "cogs.confessions"
     ]
 
