@@ -333,14 +333,20 @@ async def safe_respond(interaction: discord.Interaction, /, *, content=None, emb
     interaction.response has already been used (e.g. via defer()).
     """
     send_view = view if view is not None else discord.utils.MISSING
+    # discord.py's mutual-exclusivity check for embed/embeds is against its
+    # MISSING sentinel, not None — passing embed=None explicitly (rather
+    # than omitting it) still counts as "provided" and conflicts with an
+    # embeds=[...] list passed through **kwargs. Converting None to MISSING
+    # here (same fix already applied to view above) avoids that collision.
+    send_embed = embed if embed is not None else discord.utils.MISSING
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.response.send_message(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
         else:
-            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
     except Exception:
         try:
-            await interaction.followup.send(content=content, embed=embed, view=send_view, ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(content=content, embed=send_embed, view=send_view, ephemeral=ephemeral, **kwargs)
         except Exception:
             logger.exception("safe_respond failed to send followup")
 
@@ -421,11 +427,66 @@ async def get_missing_dating_requirements(user_id: int) -> List[str]:
     return missing
 
 
+# Set once by DatingCog.__init__ — lets recompute_dating_eligible (called
+# from many places: the wizard, edits, PhotoConfirmView) reach Discord's API
+# for role cleanup and the completion DM without threading a bot/guild
+# reference through every single call site.
+_bot_instance: Optional[commands.Bot] = None
+
+PROFILE_COMPLETE_TUTORIAL = (
+    "**Here's how LooksMatch works:**\n\n"
+    "💕 **Discover** — head to the discovery channel and press **Start Dating** to browse profiles matched to your preferences. "
+    "Use ❤️ **Like**, ❌ **Pass**, or 🚫 **Block** on each one.\n"
+    "💌 **Matches** — when you both like each other, a private ticket channel opens just for the two of you to chat.\n"
+    "👤 **Your Profile** — view or edit it anytime from the profile panel in the server.\n"
+    "🤩 **Liked You** — see who's already liked your profile.\n"
+    "⭐ **Get Rated** — get an official community looks rating if you want one.\n\n"
+    "Have fun, and please be respectful! 💕"
+)
+
+
+async def _handle_profile_completion(user_id: int):
+    """Runs once, the moment a profile transitions from incomplete to
+    complete: strips the onboarding 'please create a profile' role if still
+    present (regardless of whether they came from onboarding or the normal
+    profile panel — the role no longer applies either way), and sends a
+    short one-time tutorial DM."""
+    if not _bot_instance:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT guild_id FROM users WHERE user_id = ?", (user_id,)) as c:
+            row = await c.fetchone()
+    guild_id = row[0] if row else None
+
+    role_id = getattr(config, "ROLE_CREATE_DATING_PROFILE", None)
+    if guild_id and role_id:
+        guild = _bot_instance.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+        if member:
+            role = guild.get_role(role_id)
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="Dating profile completed")
+                except Exception:
+                    logger.exception("Failed to remove onboarding role after profile completion")
+
+    try:
+        user = await _bot_instance.fetch_user(user_id)
+        dm = await user.create_dm()
+        embed = discord.Embed(title="🎉 Your profile is complete!", description=PROFILE_COMPLETE_TUTORIAL, color=config.PRIMARY_COLOR)
+        await dm.send(embed=embed)
+    except Exception:
+        logger.exception("Failed to send profile-completion tutorial DM to %s", user_id)
+
+
 async def recompute_dating_eligible(user_id: int):
     """A profile only becomes eligible for discovery once Age Group, Region,
     Gender, Interested In, and a bio all exist. Called after every relevant
     edit so dating_eligible (already enforced in the matching SQL) never
-    drifts out of sync with the actual profile state."""
+    drifts out of sync with the actual profile state. The first time this
+    flips a profile to complete, it also triggers onboarding-role cleanup
+    and the one-time tutorial DM (see _handle_profile_completion)."""
     missing = await get_missing_dating_requirements(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -434,11 +495,19 @@ async def recompute_dating_eligible(user_id: int):
         ) as c:
             has_bio = (await c.fetchone()) is not None
         complete = (not missing) and has_bio
+
+        async with db.execute("SELECT dating_eligible FROM users WHERE user_id = ?", (user_id,)) as c:
+            existing = await c.fetchone()
+        was_already_eligible = bool(existing[0]) if existing else False
+
         await db.execute(
             "UPDATE users SET dating_eligible = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
             (1 if complete else 0, user_id)
         )
         await db.commit()
+
+    if complete and not was_already_eligible:
+        await _handle_profile_completion(user_id)
 
 
 class ChoiceStepView(discord.ui.View):
@@ -1093,6 +1162,8 @@ async def validate_dating_contact(user_a_id: int, user_b_id: int) -> bool:
 
 class DatingCog(commands.Cog):
     def __init__(self, bot):
+        global _bot_instance
+        _bot_instance = bot
         self.bot = bot
         self._last_served_candidate: dict = {}  # user_id -> candidate_user_id, prevents immediate repeats
         self._http_session: Optional[aiohttp.ClientSession] = None
