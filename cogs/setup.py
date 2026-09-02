@@ -346,8 +346,27 @@ class SetupCog(commands.Cog):
                 await db.commit()
 
     async def trigger_onboarding_profile_setup(self, member: discord.Member):
-        # No age-role check here either — see create_profile for why. The
-        # wizard's Age step is what actually assigns a real adult role.
+        # Someone who already has a profile shouldn't get funneled back
+        # through the whole creation wizard just because they hold the
+        # onboarding role again — this happens after a leave/rejoin if
+        # Discord re-offers onboarding and re-assigns the role. Verify
+        # first, and if they're already set up, just clean up the role.
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT 1 FROM profiles WHERE user_id = ? AND bio IS NOT NULL AND bio != ''",
+                (member.id,)
+            ) as c:
+                already_has_profile = (await c.fetchone()) is not None
+
+        if already_has_profile:
+            role = member.guild.get_role(config.ROLE_CREATE_DATING_PROFILE)
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="Already has a dating profile — onboarding role not needed")
+                except Exception:
+                    logger.exception("Failed to remove redundant onboarding role from %s", member.id)
+            return
+
         embed = discord.Embed(
             title="💕 COMPLETE YOUR DATING PROFILE",
             description=(
