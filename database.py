@@ -21,6 +21,8 @@ async def init_db():
                 location TEXT,
                 dating_eligible BOOLEAN DEFAULT 1,
                 dating_enabled BOOLEAN DEFAULT 1,
+                profile_banned BOOLEAN DEFAULT 0,
+                profile_banned_reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -165,6 +167,29 @@ async def init_db():
                 confirmed BOOLEAN DEFAULT 0,
                 mode TEXT DEFAULT 'replace',
                 max_items INTEGER DEFAULT 5
+            )
+        """)
+
+        # Maps a posted staff-review message to the profile it's reviewing,
+        # so ProfileReviewView's buttons (Assign Tier / Ban / Edit Info /
+        # Dismiss) can look up the target user from whichever message was
+        # clicked, without needing per-message view state.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS profile_reviews (
+                message_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # One review thread per user — every edit after the first posts as
+        # a follow-up inside this same thread instead of a new top-level
+        # channel message, keeping the staff channel to one entry per person.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS profile_review_threads (
+                user_id INTEGER PRIMARY KEY,
+                thread_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL
             )
         """)
 
