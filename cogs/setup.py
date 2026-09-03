@@ -81,6 +81,16 @@ class ProfileManagementView(discord.ui.View):
             ) as c:
                 return (await c.fetchone()) is not None
 
+    @staticmethod
+    async def _is_profile_banned(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT profile_banned_reason FROM users WHERE user_id = ? AND profile_banned = 1",
+                (user_id,)
+            ) as c:
+                row = await c.fetchone()
+        return row[0] if row else None
+
     @discord.ui.button(label="👤 VIEW PROFILE", style=discord.ButtonStyle.primary, custom_id=config.ID_VIEW_PROFILE)
     @button_cooldown(3.0, key="view_profile_render")
     async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -101,6 +111,15 @@ class ProfileManagementView(discord.ui.View):
         # where a real (adult-only) role gets assigned. Requiring one to
         # already exist would lock everyone out before the roles have ever
         # been assigned to anyone.
+        ban_reason = await self._is_profile_banned(interaction.user.id)
+        if ban_reason:
+            await safe_respond(
+                interaction,
+                content=f"❌ Your dating profile access has been restricted by staff.\n**Reason:** {ban_reason}",
+                ephemeral=True
+            )
+            return
+
         if await self._has_profile(interaction.user.id):
             await safe_respond(
                 interaction,
@@ -167,6 +186,20 @@ class OnboardingProfileView(discord.ui.View):
     @discord.ui.button(label="✏️ CREATE DATING PROFILE", style=discord.ButtonStyle.success, custom_id=config.ID_ONBOARDING_SETUP_PROFILE)
     @button_cooldown(2.0)
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT profile_banned_reason FROM users WHERE user_id = ? AND profile_banned = 1",
+                (interaction.user.id,)
+            ) as c:
+                ban_row = await c.fetchone()
+        if ban_row:
+            await safe_respond(
+                interaction,
+                content=f"❌ Your dating profile access has been restricted by staff.\n**Reason:** {ban_row[0]}",
+                ephemeral=True
+            )
+            return
+
         from cogs.dating import ProfileEditModal
 
         dating_cog = get_dating_cog(interaction.client)
