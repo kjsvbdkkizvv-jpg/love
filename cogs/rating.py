@@ -64,6 +64,9 @@ async def staff_apply_role_change(guild: discord.Guild, target_user_id: int, rol
     """Same remove-old/add-new role + DB sync as dating.py's apply_role_change,
     but parameterized on an explicit target rather than interaction.user —
     staff are correcting SOMEONE ELSE's profile here."""
+    from cogs.dating import mark_staff_edit
+    mark_staff_edit(target_user_id)
+
     member = guild.get_member(target_user_id)
     if member:
         old_role_ids = set(role_dict.values())
@@ -103,6 +106,9 @@ class TierSelect(discord.ui.Select):
 
         chosen_tier = self.values[0]
         member = interaction.guild.get_member(self.target_user_id)
+
+        from cogs.dating import mark_staff_edit
+        mark_staff_edit(self.target_user_id)
 
         all_tier_role_ids = set(config.FEMALE_TIER_ROLES.values()) | set(config.MALE_TIER_ROLES.values())
         if member:
@@ -250,6 +256,78 @@ class EditFieldChooserView(discord.ui.View):
 class ProfileReviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="review:prev_media")
+    async def prev_media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._navigate_media(interaction, -1)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="review:next_media")
+    async def next_media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._navigate_media(interaction, 1)
+
+    async def _navigate_media(self, interaction: discord.Interaction, delta: int):
+        if not is_staff(interaction.user):
+            await safe_respond(interaction, content="Staff only.", ephemeral=True)
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT user_id, media_index FROM profile_reviews WHERE message_id = ?",
+                (interaction.message.id,)
+            ) as c:
+                row = await c.fetchone()
+        if not row:
+            await safe_respond(interaction, content="⚠️ Couldn't find this review's profile.", ephemeral=True)
+            return
+        target_user_id, current_index = row
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("""
+                SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests,
+                       r.tier, r.overall_average, u.interested_in
+                FROM users u
+                LEFT JOIN profiles p ON u.user_id = p.user_id
+                LEFT JOIN rating_results r ON u.user_id = r.user_id
+                WHERE u.user_id = ?
+            """, (target_user_id,)) as c:
+                prow = await c.fetchone()
+        if not prow:
+            await safe_respond(interaction, content="⚠️ Profile no longer found.", ephemeral=True)
+            return
+
+        media_raw = json.loads(prow[4]) if prow[4] else []
+        if not media_raw:
+            await safe_respond(interaction, content="This profile has no media to flip through.", ephemeral=True)
+            return
+
+        new_index = (current_index + delta) % len(media_raw)
+
+        await interaction.response.defer()
+
+        # Local imports: rating.py doesn't own card rendering, dating.py does.
+        from cogs.dating import build_card_files, resolve_profile_media, wrap_card_embeds
+
+        media = await resolve_profile_media(interaction.client, media_raw)
+        dating_cog = interaction.client.get_cog("DatingCog")
+        member = interaction.guild.get_member(target_user_id) if interaction.guild else None
+        display_name = member.display_name if member else f"Member {str(target_user_id)[-4:]}"
+        is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
+        tier_text = f"{prow[7]} · {prow[8]}/10" if prow[8] else prow[7]
+
+        files = await build_card_files(
+            dating_cog._http_session, media, new_index,
+            display_name=display_name, age_group=prow[0], location=prow[2],
+            is_verified=is_verified, tier_text=tier_text, gender=prow[1],
+            interested_in=prow[9], interests=json.loads(prow[6]) if prow[6] else [],
+            dating_intent=prow[5], bio=prow[3],
+            executor=dating_cog._render_executor,
+        )
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE profile_reviews SET media_index = ? WHERE message_id = ?", (new_index, interaction.message.id))
+            await db.commit()
+
+        await interaction.edit_original_response(attachments=files, embeds=wrap_card_embeds(files), view=self)
 
     @discord.ui.button(label="🏷️ Assign Tier", style=discord.ButtonStyle.primary, custom_id="review:assign_tier")
     async def assign_tier(self, interaction: discord.Interaction, button: discord.ui.Button):
