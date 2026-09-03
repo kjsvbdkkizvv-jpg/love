@@ -178,6 +178,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS profile_reviews (
                 message_id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL,
+                media_index INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
