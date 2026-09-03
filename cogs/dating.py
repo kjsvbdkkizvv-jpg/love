@@ -480,13 +480,97 @@ async def _handle_profile_completion(user_id: int):
         logger.exception("Failed to send profile-completion tutorial DM to %s", user_id)
 
 
+async def post_profile_for_staff_review(user_id: int, is_new: bool):
+    """Posts the profile's rendered card into the staff review channel
+    (reusing the same card renderer members see, so staff sees exactly what
+    the community does), with the moderation controls from cogs/rating.py
+    attached. Fires every time a profile is complete — both the first time
+    and on every subsequent edit — so staff can catch mismatches (e.g.
+    wrong age bracket, wrong gender) or inappropriate media as soon as they
+    appear, not just once at signup."""
+    if not _bot_instance:
+        return
+
+    channel_id = getattr(config, "CHANNEL_STAFF_PROFILE_REVIEW", None)
+    if not channel_id:
+        logger.warning("CHANNEL_STAFF_PROFILE_REVIEW not configured — profile review was not posted for %s", user_id)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT guild_id FROM users WHERE user_id = ?", (user_id,)) as c:
+            row = await c.fetchone()
+    guild_id = row[0] if row else None
+    if not guild_id:
+        return
+    guild = _bot_instance.get_guild(guild_id)
+    if not guild:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        logger.warning("CHANNEL_STAFF_PROFILE_REVIEW (%s) not found in guild %s", channel_id, guild_id)
+        return
+
+    dating_cog = _bot_instance.get_cog("DatingCog")
+    if not dating_cog:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT u.age_group, u.gender, u.location, p.bio, p.photos, p.dating_intent, p.interests,
+                   r.tier, r.overall_average, u.interested_in
+            FROM users u
+            LEFT JOIN profiles p ON u.user_id = p.user_id
+            LEFT JOIN rating_results r ON u.user_id = r.user_id
+            WHERE u.user_id = ?
+        """, (user_id,)) as c:
+            row = await c.fetchone()
+    if not row:
+        return
+
+    media = await resolve_profile_media(_bot_instance, json.loads(row[4]) if row[4] else [])
+    tier_text = f"{row[7]} · {row[8]}/10" if row[8] else row[7]
+    member = guild.get_member(user_id)
+    display_name = member.display_name if member else f"Member {str(user_id)[-4:]}"
+    is_verified = bool(member and any(r.id == config.ROLE_VERIFIED for r in member.roles))
+
+    files = await build_card_files(
+        dating_cog._http_session, media, 0,
+        display_name=display_name, age_group=row[0], location=row[2],
+        is_verified=is_verified, tier_text=tier_text, gender=row[1],
+        interested_in=row[9], interests=json.loads(row[6]) if row[6] else [],
+        dating_intent=row[5], bio=row[3],
+        executor=dating_cog._render_executor,
+    )
+
+    # Local import: cogs/rating.py owns the moderation view, dating.py just
+    # triggers it — avoids a module-level circular import.
+    from cogs.rating import ProfileReviewView
+
+    label = "🆕 New Profile" if is_new else "✏️ Profile Updated"
+    try:
+        msg = await channel.send(
+            content=f"{label} — <@{user_id}>",
+            embeds=wrap_card_embeds(files),
+            files=files,
+            view=ProfileReviewView()
+        )
+    except Exception:
+        logger.exception("Failed to post profile for staff review (user %s)", user_id)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO profile_reviews (message_id, user_id) VALUES (?, ?)", (msg.id, user_id))
+        await db.commit()
+
+
 async def recompute_dating_eligible(user_id: int):
     """A profile only becomes eligible for discovery once Age Group, Region,
     Gender, Interested In, and a bio all exist. Called after every relevant
     edit so dating_eligible (already enforced in the matching SQL) never
     drifts out of sync with the actual profile state. The first time this
     flips a profile to complete, it also triggers onboarding-role cleanup
-    and the one-time tutorial DM (see _handle_profile_completion)."""
+    and the one-time tutorial DM (see _handle_profile_completion); every
+    time it's complete — new or edited — it also posts to staff review."""
     missing = await get_missing_dating_requirements(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -508,6 +592,9 @@ async def recompute_dating_eligible(user_id: int):
 
     if complete and not was_already_eligible:
         await _handle_profile_completion(user_id)
+
+    if complete:
+        await post_profile_for_staff_review(user_id, is_new=not was_already_eligible)
 
 
 class ChoiceStepView(discord.ui.View):
@@ -1178,6 +1265,28 @@ class DatingCog(commands.Cog):
 
     async def cog_load(self):
         self._http_session = aiohttp.ClientSession()
+        # Idempotent migration for the staff profile-review system.
+        async with aiosqlite.connect(DB_PATH) as db:
+            for stmt in (
+                "ALTER TABLE users ADD COLUMN profile_banned BOOLEAN DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN profile_banned_reason TEXT",
+            ):
+                try:
+                    await db.execute(stmt)
+                    await db.commit()
+                except Exception:
+                    pass  # column already exists
+            try:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS profile_reviews (
+                        message_id INTEGER PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await db.commit()
+            except Exception:
+                pass
 
     async def cog_unload(self):
         if self._http_session and not self._http_session.closed:
