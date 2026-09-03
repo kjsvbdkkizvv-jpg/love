@@ -480,6 +480,32 @@ async def _handle_profile_completion(user_id: int):
         logger.exception("Failed to send profile-completion tutorial DM to %s", user_id)
 
 
+_staff_edit_suppression: dict = {}  # user_id -> monotonic deadline; see mark_staff_edit
+
+
+def mark_staff_edit(user_id: int, seconds: float = 6.0):
+    """Called by cogs/rating.py just before it changes a member's Discord
+    roles on someone else's behalf (Assign Tier, Edit Info). Role changes
+    made this way still fire a real Discord on_member_update event like any
+    other role change, which setup.py's listener responds to by calling
+    recompute_dating_eligible — which would otherwise immediately re-post
+    the same profile to staff review again (this was the resend-loop bug:
+    every staff action triggered its own repost, sometimes several times
+    per click, and hammered the API into rate limits). This suppresses
+    that specific cascade for a few seconds after a known staff action."""
+    _staff_edit_suppression[user_id] = time.monotonic() + seconds
+
+
+def _is_suppressed(user_id: int) -> bool:
+    deadline = _staff_edit_suppression.get(user_id)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        _staff_edit_suppression.pop(user_id, None)
+        return False
+    return True
+
+
 async def post_profile_for_staff_review(user_id: int, is_new: bool):
     """Posts the profile's rendered card into the staff review channel
     (reusing the same card renderer members see, so staff sees exactly what
@@ -487,8 +513,15 @@ async def post_profile_for_staff_review(user_id: int, is_new: bool):
     attached. Fires every time a profile is complete — both the first time
     and on every subsequent edit — so staff can catch mismatches (e.g.
     wrong age bracket, wrong gender) or inappropriate media as soon as they
-    appear, not just once at signup."""
+    appear, not just once at signup.
+
+    Every edit after the first posts as a follow-up inside a single
+    per-user thread rather than a new top-level channel message, so the
+    staff channel itself stays to one entry per person no matter how many
+    times they edit."""
     if not _bot_instance:
+        return
+    if _is_suppressed(user_id):
         return
 
     channel_id = getattr(config, "CHANNEL_STAFF_PROFILE_REVIEW", None)
@@ -547,19 +580,55 @@ async def post_profile_for_staff_review(user_id: int, is_new: bool):
     from cogs.rating import ProfileReviewView
 
     label = "🆕 New Profile" if is_new else "✏️ Profile Updated"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT thread_id FROM profile_review_threads WHERE user_id = ?", (user_id,)) as c:
+            thread_row = await c.fetchone()
+
+    destination = None
+    if thread_row:
+        thread_id = thread_row[0]
+        destination = guild.get_thread(thread_id) or _bot_instance.get_channel(thread_id)
+        if destination is None:
+            try:
+                destination = await _bot_instance.fetch_channel(thread_id)
+            except Exception:
+                destination = None  # thread was deleted — fall back to posting fresh below
+
     try:
-        msg = await channel.send(
-            content=f"{label} — <@{user_id}>",
-            embeds=wrap_card_embeds(files),
-            files=files,
-            view=ProfileReviewView()
-        )
+        if destination:
+            msg = await destination.send(
+                content=f"{label} — <@{user_id}>",
+                embeds=wrap_card_embeds(files),
+                files=files,
+                view=ProfileReviewView()
+            )
+        else:
+            msg = await channel.send(
+                content=f"{label} — <@{user_id}>",
+                embeds=wrap_card_embeds(files),
+                files=files,
+                view=ProfileReviewView()
+            )
+            try:
+                thread = await msg.create_thread(name=f"Profile — {display_name}"[:100])
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO profile_review_threads (user_id, thread_id, channel_id) VALUES (?, ?, ?)",
+                        (user_id, thread.id, channel.id)
+                    )
+                    await db.commit()
+            except Exception:
+                logger.exception("Failed to create review thread for %s", user_id)
     except Exception:
         logger.exception("Failed to post profile for staff review (user %s)", user_id)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO profile_reviews (message_id, user_id) VALUES (?, ?)", (msg.id, user_id))
+        await db.execute(
+            "INSERT OR REPLACE INTO profile_reviews (message_id, user_id, media_index) VALUES (?, ?, 0)",
+            (msg.id, user_id)
+        )
         await db.commit()
 
 
@@ -1281,7 +1350,24 @@ class DatingCog(commands.Cog):
                     CREATE TABLE IF NOT EXISTS profile_reviews (
                         message_id INTEGER PRIMARY KEY,
                         user_id INTEGER NOT NULL,
+                        media_index INTEGER DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await db.commit()
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE profile_reviews ADD COLUMN media_index INTEGER DEFAULT 0")
+                await db.commit()
+            except Exception:
+                pass  # column already exists
+            try:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS profile_review_threads (
+                        user_id INTEGER PRIMARY KEY,
+                        thread_id INTEGER NOT NULL,
+                        channel_id INTEGER NOT NULL
                     )
                 """)
                 await db.commit()
