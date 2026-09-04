@@ -17,6 +17,7 @@ Memory-safety notes (this file previously caused OOM crashes in production):
 from __future__ import annotations
 import io
 import os
+import unicodedata
 from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageChops
@@ -213,6 +214,22 @@ def _draw_gradient_chip(card, draw, x, y, text, font, colors, icon_fn=None,
     return x + w + 10
 
 
+def _sanitize_display_text(text):
+    """Many Discord display names use 'fancy' stylized unicode — mathematical
+    bold/italic/script letter blocks, full-width forms, circled letters, etc.
+    — that our bundled font (Poppins) has no glyphs for, rendering as blank
+    tofu boxes. NFKD normalization decomposes most of these back to their
+    plain-Latin equivalent (that's what those Unicode blocks are FOR —
+    compatibility decomposition to the base letter), which the font can
+    actually render. Combining marks picked up by decomposition (accents)
+    are dropped too, since an accented form may still be missing even once
+    the base letter resolves."""
+    if not text:
+        return text
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
+
 def render_profile_card(
     *,
     main_image_bytes,
@@ -231,6 +248,7 @@ def render_profile_card(
     dating_intent,
     bio,
 ):
+    display_name = _sanitize_display_text(display_name)
     card = Image.new("RGB", (CARD_W, CARD_H), BG_COLOR)
 
     font_name = _load_font(FONT_BOLD_CANDIDATES, 38)
