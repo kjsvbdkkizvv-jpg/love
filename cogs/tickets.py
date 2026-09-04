@@ -85,13 +85,24 @@ class PhotoConfirmView(discord.ui.View):
             source_channel = interaction.channel
             found = []
             try:
-                async for msg in source_channel.history(limit=200, oldest_first=True):
+                # Newest-first (the default when no `after`/`oldest_first` is
+                # passed) — critical fix: oldest_first=True was fetching the
+                # OLDEST 200 messages in the channel. That's fine for a brand
+                # new guild ticket channel (nothing existed before it), but a
+                # DM with the bot accumulates messages across the whole
+                # onboarding conversation — once it passed 200 messages, the
+                # oldest-200 window could miss the photos someone had JUST
+                # uploaded entirely, since those are among the newest
+                # messages, not the oldest. Scanning newest-first and
+                # reversing afterward guarantees we always see the most
+                # recent uploads, while still preserving upload order.
+                async for msg in source_channel.history(limit=200):
                     for att in msg.attachments:
                         if att.content_type and (att.content_type.startswith("image/") or att.content_type.startswith("video/")):
                             found.append(att)
                     if len(found) >= self.max_items:
                         break
-                found = found[:self.max_items]
+                found = list(reversed(found[:self.max_items]))
 
                 if not found:
                     async with aiosqlite.connect(DB_PATH) as db:
